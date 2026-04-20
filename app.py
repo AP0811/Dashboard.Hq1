@@ -1122,6 +1122,42 @@ def show_admin_dashboard():
     else:
         st.warning("Fichier de données non trouvé.")
 
+
+reset_token_param = st.query_params.get('reset_token')
+if reset_token_param:
+    if isinstance(reset_token_param, list):
+        reset_token_param = reset_token_param[0]
+
+    email_from_token = verify_reset_token(reset_token_param)
+    if email_from_token is None:
+        st.error('Ce lien de réinitialisation est invalide ou a expiré. Demande un nouveau lien.')
+    else:
+        st.title('Choisir un nouveau mot de passe')
+        st.info(f'Réinitialisation pour : **{email_from_token}**')
+
+        with st.form('password_reset_token_form'):
+            new_password = st.text_input('Nouveau mot de passe', type='password', key='token_new_password')
+            confirm_password = st.text_input('Confirmer le mot de passe', type='password', key='token_confirm_password')
+
+            if st.form_submit_button('Enregistrer le nouveau mot de passe'):
+                if not new_password or not confirm_password:
+                    st.error('Les deux champs de mot de passe sont requis.')
+                elif new_password != confirm_password:
+                    st.error('Les mots de passe ne correspondent pas.')
+                else:
+                    updated, msg = update_password_in_file(email_from_token, new_password)
+                    if updated:
+                        consume_reset_token(reset_token_param)
+                        st.query_params.clear()
+                        st.success('Mot de passe mis à jour. Tu peux maintenant te connecter.')
+                        st.rerun()
+                    elif msg == 'permission':
+                        st.error('Impossible d’écrire le fichier des identifiants. Vérifie les permissions.')
+                    else:
+                        st.error('Impossible de mettre à jour le mot de passe. Réessaie ou contacte un administrateur.')
+
+    st.stop()
+
 authenticator = stauth.Authenticate(
     credentials=users,
     cookie_name='workout_dashboard',
