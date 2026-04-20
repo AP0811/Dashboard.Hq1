@@ -1,7 +1,13 @@
-import streamlit as st
+﻿import streamlit as st
 import streamlit_authenticator as stauth
 import pandas as pd
 import os
+import smtplib
+import secrets
+import time
+import json
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
@@ -53,6 +59,21 @@ def resolve_data_root():
 
 DATA_ROOT = resolve_data_root()
 AUTH_COOKIE_KEY = os.getenv('APP_AUTH_COOKIE_KEY', 'workout_dashboard_cookie_key_change_me_2026_32_plus_chars')
+
+# Configuration SMTP — priorité: st.secrets > variables d'environnement
+def _secret(key, default=''):
+    try:
+        return st.secrets.get(key, os.getenv(key, default))
+    except Exception:
+        return os.getenv(key, default)
+
+SMTP_HOST     = _secret('SMTP_HOST', 'smtp.gmail.com')
+SMTP_PORT     = int(_secret('SMTP_PORT', '587'))
+SMTP_USER     = _secret('SMTP_USER', '')
+SMTP_PASSWORD = _secret('SMTP_PASSWORD', '')
+SMTP_FROM     = _secret('SMTP_FROM', SMTP_USER)
+APP_BASE_URL  = _secret('APP_BASE_URL', 'http://localhost:8501')
+RESET_TOKEN_EXPIRY = 1800  # 30 minutes
 
 CREDENTIALS_FOLDER = os.path.join(DATA_ROOT, 'credentials')
 CREDENTIALS_XLSX = os.path.join(CREDENTIALS_FOLDER, 'users.xlsx')
@@ -303,6 +324,91 @@ def update_password_in_file(email, password):
     return True, None
 
 
+# ── Gestion des tokens de réinitialisation par courriel ──────────────────────
+
+def _tokens_file():
+    return os.path.join(DATA_ROOT, 'metadata', 'reset_tokens.json')
+
+
+def _load_tokens():
+    path = _tokens_file()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_tokens(tokens):
+    os.makedirs(os.path.dirname(_tokens_file()), exist_ok=True)
+    with open(_tokens_file(), 'w') as f:
+        json.dump(tokens, f)
+
+
+def generate_reset_token(email):
+    tokens = _load_tokens()
+    now = time.time()
+    # Nettoyer les tokens expirés
+    tokens = {k: v for k, v in tokens.items() if v['expires_at'] > now}
+    token = secrets.token_urlsafe(32)
+    tokens[token] = {'email': email.strip().lower(), 'expires_at': now + RESET_TOKEN_EXPIRY}
+    _save_tokens(tokens)
+    return token
+
+
+def verify_reset_token(token):
+    tokens = _load_tokens()
+    entry = tokens.get(str(token))
+    if not entry:
+        return None
+    if time.time() > entry['expires_at']:
+        return None
+    return entry['email']
+
+
+def consume_reset_token(token):
+    tokens = _load_tokens()
+    tokens.pop(str(token), None)
+    _save_tokens(tokens)
+
+
+def send_reset_email(to_email, token):
+    if not SMTP_USER or not SMTP_PASSWORD:
+        return False, 'smtp_non_configure'
+
+    reset_url = f"{APP_BASE_URL}?reset_token={token}"
+
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = 'Réinitialisation de votre mot de passe'
+    msg['From'] = SMTP_FROM
+    msg['To'] = to_email
+
+    corps = (
+        f"Bonjour,\n\n"
+        f"Une demande de réinitialisation de mot de passe a été reçue pour votre compte.\n\n"
+        f"Cliquez sur le lien ci-dessous pour choisir un nouveau mot de passe.\n"
+        f"Ce lien est valide pendant 30 minutes et ne peut être utilisé qu'une seule fois :\n\n"
+        f"{reset_url}\n\n"
+        f"Si vous n'avez pas fait cette demande, ignorez simplement ce courriel.\n\n"
+        f"L'équipe Dashboard Entraînement"
+    )
+    msg.attach(MIMEText(corps, 'plain', 'utf-8'))
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(SMTP_FROM, to_email, msg.as_string())
+        return True, None
+    except smtplib.SMTPAuthenticationError:
+        return False, 'auth'
+    except Exception as exc:
+        return False, str(exc)
+
+
 with st.sidebar.expander('Créer un compte'):
     with st.form('register_form', clear_on_submit=True):
         new_email = st.text_input('Adresse courriel')
@@ -327,24 +433,32 @@ with st.sidebar.expander('Créer un compte'):
                     st.error('Impossible de créer le compte. Vérifie les informations et réessaie.')
 
 with st.sidebar.expander('Mot de passe oublié'):
-    with st.form('reset_form', clear_on_submit=True):
-        reset_email = st.text_input('Adresse courriel', key='reset_email')
-        reset_password = st.text_input('Nouveau mot de passe', type='password', key='reset_password')
-        if st.form_submit_button('Réinitialiser le mot de passe'):
-            if not reset_email or not reset_password:
-                st.error('Adresse courriel et nouveau mot de passe sont requis.')
-            else:
-                updated, msg = update_password_in_file(reset_email, reset_password)
-                if updated:
-                    st.success('Mot de passe mis à jour. Recharge la page pour te connecter.')
-                    st.experimental_rerun()
-                elif msg == 'not_found':
-                    st.error('Aucun compte trouvé pour cette adresse courriel.')
-                elif msg == 'permission':
-                    st.error('Impossible d’écrire le fichier des identifiants. Ferme le fichier Excel ou vérifie les permissions.')
+    if not SMTP_USER or not SMTP_PASSWORD:
+        st.warning('Réinitialisation par courriel non configurée. Contacte un administrateur.')
+    else:
+        with st.form('reset_form', clear_on_submit=True):
+            reset_email = st.text_input('Adresse courriel', key='reset_email')
+            if st.form_submit_button('Envoyer le lien de réinitialisation'):
+                if not reset_email:
+                    st.error('Adresse courriel requise.')
                 else:
-                    st.error('Impossible de réinitialiser le mot de passe.')
-
+                    df_creds = read_credentials_df()
+                    email_exists = False
+                    if df_creds is not None and not df_creds.empty:
+                        ec = find_column(df_creds.columns, ['email', 'courriel', 'adresse courriel', 'Id'])
+                        if ec:
+                            email_exists = reset_email.strip().lower() in df_creds[ec].astype(str).str.lower().str.strip().tolist()
+                    if email_exists:
+                        token = generate_reset_token(reset_email)
+                        sent, err = send_reset_email(reset_email, token)
+                        if not sent and err == 'auth':
+                            st.error("Erreur d'authentification SMTP. Vérifie les variables SMTP_USER et SMTP_PASSWORD.")
+                        elif not sent:
+                            st.error(f"Erreur d'envoi : {err}")
+                        else:
+                            st.success('Si ce courriel est associé à un compte, un lien de réinitialisation a été envoyé (valide 30 minutes).')
+                    else:
+                        st.success('Si ce courriel est associé à un compte, un lien de réinitialisation a été envoyé (valide 30 minutes).')
 def load_athlete_data(athlete_id):
     if not os.path.exists(file_path):
         st.error("Fichier de données non trouvé.")
