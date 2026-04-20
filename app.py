@@ -3,7 +3,9 @@ import streamlit_authenticator as stauth
 import pandas as pd
 import os
 import smtplib
-import secrets
+import base64
+import hashlib
+import hmac
 import time
 import json
 from email.mime.text import MIMEText
@@ -73,6 +75,7 @@ SMTP_USER     = _secret('SMTP_USER', '')
 SMTP_PASSWORD = _secret('SMTP_PASSWORD', '')
 SMTP_FROM     = _secret('SMTP_FROM', SMTP_USER)
 APP_BASE_URL  = _secret('APP_BASE_URL', 'http://localhost:8501')
+RESET_TOKEN_SECRET = _secret('APP_RESET_TOKEN_SECRET', AUTH_COOKIE_KEY)
 RESET_TOKEN_EXPIRY = 1800  # 30 minutes
 
 CREDENTIALS_FOLDER = os.path.join(DATA_ROOT, 'credentials')
@@ -317,7 +320,6 @@ def update_password_in_file(email, password):
     match = df[email_col].str.lower() == email.lower()
     if not match.any():
         return False, 'not_found'
-
     df.loc[match, 'password'] = stauth.Hasher.hash(password)
     if not write_credentials_df(df):
         return False, 'permission'
@@ -326,52 +328,98 @@ def update_password_in_file(email, password):
 
 # ── Gestion des tokens de réinitialisation par courriel ──────────────────────
 
-def _tokens_file():
-    return os.path.join(DATA_ROOT, 'metadata', 'reset_tokens.json')
+def _get_user_auth_record(email):
+    df = read_credentials_df()
+    if df is None or df.empty:
+        return None
+
+    email_col = find_column(df.columns, ['email', 'courriel', 'adresse courriel', 'Id'])
+    password_col = find_column(df.columns, ['password', 'mot de passe', 'mdp'])
+    if email_col is None or password_col is None:
+        return None
+
+    df[email_col] = df[email_col].astype(str).str.strip()
+    matches = df[df[email_col].str.lower() == str(email).strip().lower()]
+    if matches.empty:
+        return None
+
+    row = matches.iloc[0]
+    return {
+        'email': str(row[email_col]).strip().lower(),
+        'password_hash': str(row[password_col]).strip()
+    }
 
 
-def _load_tokens():
-    path = _tokens_file()
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, 'r') as f:
-            return json.load(f)
-    except Exception:
-        return {}
+def _b64url_encode(data):
+    return base64.urlsafe_b64encode(data).decode('utf-8').rstrip('=')
 
 
-def _save_tokens(tokens):
-    os.makedirs(os.path.dirname(_tokens_file()), exist_ok=True)
-    with open(_tokens_file(), 'w') as f:
-        json.dump(tokens, f)
+def _b64url_decode(data):
+    padding = '=' * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
+
+
+def _password_fingerprint(password_hash):
+    return hashlib.sha256(password_hash.encode('utf-8')).hexdigest()[:16]
 
 
 def generate_reset_token(email):
-    tokens = _load_tokens()
-    now = time.time()
-    # Nettoyer les tokens expirés
-    tokens = {k: v for k, v in tokens.items() if v['expires_at'] > now}
-    token = secrets.token_urlsafe(32)
-    tokens[token] = {'email': email.strip().lower(), 'expires_at': now + RESET_TOKEN_EXPIRY}
-    _save_tokens(tokens)
-    return token
+    user_record = _get_user_auth_record(email)
+    if user_record is None:
+        return None
+
+    payload = {
+        'email': user_record['email'],
+        'exp': int(time.time()) + RESET_TOKEN_EXPIRY,
+        'pwd': _password_fingerprint(user_record['password_hash'])
+    }
+    payload_bytes = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+    signature = hmac.new(
+        RESET_TOKEN_SECRET.encode('utf-8'),
+        payload_bytes,
+        hashlib.sha256
+    ).digest()
+    return f"{_b64url_encode(payload_bytes)}.{_b64url_encode(signature)}"
 
 
 def verify_reset_token(token):
-    tokens = _load_tokens()
-    entry = tokens.get(str(token))
-    if not entry:
+    try:
+        payload_part, signature_part = str(token).split('.', 1)
+        payload_bytes = _b64url_decode(payload_part)
+        signature = _b64url_decode(signature_part)
+    except Exception:
         return None
-    if time.time() > entry['expires_at']:
+
+    expected_signature = hmac.new(
+        RESET_TOKEN_SECRET.encode('utf-8'),
+        payload_bytes,
+        hashlib.sha256
+    ).digest()
+    if not hmac.compare_digest(signature, expected_signature):
         return None
-    return entry['email']
+
+    try:
+        payload = json.loads(payload_bytes.decode('utf-8'))
+    except Exception:
+        return None
+
+    if time.time() > payload.get('exp', 0):
+        return None
+
+    email = payload.get('email')
+    user_record = _get_user_auth_record(email)
+    if user_record is None:
+        return None
+
+    if payload.get('pwd') != _password_fingerprint(user_record['password_hash']):
+        return None
+
+    return user_record['email']
 
 
 def consume_reset_token(token):
-    tokens = _load_tokens()
-    tokens.pop(str(token), None)
-    _save_tokens(tokens)
+    # Token stateless: après changement de mot de passe, il devient invalide automatiquement.
+    return None
 
 
 def send_reset_email(to_email, token):
@@ -450,13 +498,16 @@ with st.sidebar.expander('Mot de passe oublié'):
                             email_exists = reset_email.strip().lower() in df_creds[ec].astype(str).str.lower().str.strip().tolist()
                     if email_exists:
                         token = generate_reset_token(reset_email)
-                        sent, err = send_reset_email(reset_email, token)
-                        if not sent and err == 'auth':
-                            st.error("Erreur d'authentification SMTP. Vérifie les variables SMTP_USER et SMTP_PASSWORD.")
-                        elif not sent:
-                            st.error(f"Erreur d'envoi : {err}")
-                        else:
+                        if token is None:
                             st.success('Si ce courriel est associé à un compte, un lien de réinitialisation a été envoyé (valide 30 minutes).')
+                        else:
+                            sent, err = send_reset_email(reset_email, token)
+                            if not sent and err == 'auth':
+                                st.error("Erreur d'authentification SMTP. Vérifie les variables SMTP_USER et SMTP_PASSWORD.")
+                            elif not sent:
+                                st.error(f"Erreur d'envoi : {err}")
+                            else:
+                                st.success('Si ce courriel est associé à un compte, un lien de réinitialisation a été envoyé (valide 30 minutes).')
                     else:
                         st.success('Si ce courriel est associé à un compte, un lien de réinitialisation a été envoyé (valide 30 minutes).')
 def load_athlete_data(athlete_id):
