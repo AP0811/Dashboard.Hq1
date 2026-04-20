@@ -17,10 +17,25 @@ COLOR_PALETTE = {
     'Cardio': '#4ECDC4',      # Turquoise
     'Hockey': '#45B7D1',      # Bleu principal
     'Sport': '#FFA07A',       # Orange
-    'Skills': '#7FB3D5',      # Bleu clair (nuance de Hockey)
+    'Habiletés': '#7FB3D5',   # Bleu clair (nuance de Hockey)
     'Pratique': '#2E86AB',    # Bleu moyen (nuance de Hockey)
     'Match': '#1B4F72',       # Bleu foncé (nuance de Hockey)
     'Repos': '#E0E0E0'        # Gris
+}
+
+FRENCH_MONTHS = {
+    1: 'Janvier',
+    2: 'Février',
+    3: 'Mars',
+    4: 'Avril',
+    5: 'Mai',
+    6: 'Juin',
+    7: 'Juillet',
+    8: 'Août',
+    9: 'Septembre',
+    10: 'Octobre',
+    11: 'Novembre',
+    12: 'Décembre'
 }
 
 # Configuration des utilisateurs
@@ -29,7 +44,7 @@ PRIVATE_DATA_DIR = 'private_data'
 
 
 def resolve_data_root():
-    # Priorite: variable d'environnement > private_data
+    # Priorité: variable d'environnement > private_data
     env_data_dir = os.getenv('APP_DATA_DIR')
     if env_data_dir:
         return env_data_dir
@@ -63,6 +78,11 @@ def find_column(columns, choices):
     return None
 
 
+def format_date_fr(value):
+    dt = pd.to_datetime(value)
+    return f"{dt.day:02d} {FRENCH_MONTHS[dt.month]} {dt.year}"
+
+
 def read_credentials_df():
     if os.path.exists(CREDENTIALS_CSV):
         return pd.read_csv(CREDENTIALS_CSV)
@@ -70,7 +90,7 @@ def read_credentials_df():
         try:
             return pd.read_excel(CREDENTIALS_XLSX)
         except PermissionError:
-            st.warning('Le fichier credentials Excel est ouvert dans une autre application. Ferme-le pour charger les comptes.')
+            st.warning('Le fichier des identifiants est ouvert dans une autre application. Ferme-le pour charger les comptes.')
             return pd.DataFrame()
     return None
 
@@ -89,7 +109,7 @@ def load_user_credentials():
         athlete_id_col = find_column(df.columns, ['athlete_id', 'id', 'utilisateur'])
 
         if email_col is None or password_col is None:
-            st.warning('Le fichier de credentials doit contenir au moins les colonnes email et password.')
+            st.warning('Le fichier des identifiants doit contenir au moins les colonnes courriel et mot de passe.')
             return {'usernames': DEFAULT_USERS}
 
         credentials = {'usernames': {}}
@@ -291,7 +311,7 @@ with st.sidebar.expander('Créer un compte'):
         athlete_id = st.text_input('Identifiant athlète (facultatif)')
         if st.form_submit_button('Créer un compte'):
             if not new_email or not new_password:
-                st.error('Email et mot de passe sont requis.')
+                st.error('Adresse courriel et mot de passe sont requis.')
             else:
                 if not athlete_id:
                     athlete_id = new_email
@@ -300,9 +320,9 @@ with st.sidebar.expander('Créer un compte'):
                     st.success('Compte créé. Recharge la page pour te connecter.')
                     st.experimental_rerun()
                 elif msg == 'exists':
-                    st.warning('Cet email existe déjà. Utilise la récupération de mot de passe si nécessaire.')
+                    st.warning('Cette adresse courriel existe déjà. Utilise la récupération de mot de passe si nécessaire.')
                 elif msg == 'permission':
-                    st.error('Impossible d’écrire le fichier de credentials. Ferme le fichier Excel ou vérifie les permissions.')
+                    st.error('Impossible d’écrire le fichier des identifiants. Ferme le fichier Excel ou vérifie les permissions.')
                 else:
                     st.error('Impossible de créer le compte. Vérifie les informations et réessaie.')
 
@@ -312,16 +332,16 @@ with st.sidebar.expander('Mot de passe oublié'):
         reset_password = st.text_input('Nouveau mot de passe', type='password', key='reset_password')
         if st.form_submit_button('Réinitialiser le mot de passe'):
             if not reset_email or not reset_password:
-                st.error('Email et nouveau mot de passe sont requis.')
+                st.error('Adresse courriel et nouveau mot de passe sont requis.')
             else:
                 updated, msg = update_password_in_file(reset_email, reset_password)
                 if updated:
                     st.success('Mot de passe mis à jour. Recharge la page pour te connecter.')
                     st.experimental_rerun()
                 elif msg == 'not_found':
-                    st.error('Aucun compte trouvé pour cet email.')
+                    st.error('Aucun compte trouvé pour cette adresse courriel.')
                 elif msg == 'permission':
-                    st.error('Impossible d’écrire le fichier de credentials. Ferme le fichier Excel ou vérifie les permissions.')
+                    st.error('Impossible d’écrire le fichier des identifiants. Ferme le fichier Excel ou vérifie les permissions.')
                 else:
                     st.error('Impossible de réinitialiser le mot de passe.')
 
@@ -449,7 +469,7 @@ def create_activity_calendar(df_filtered, activity_cols):
     
     while current <= max_date:
         year, month = current.year, current.month
-        with st.expander(f"📅 {cal_module.month_name[month]} {year}"):
+        with st.expander(f"📅 {FRENCH_MONTHS[month]} {year}"):
             # Créer une grille de dates
             cal = cal_module.monthcalendar(year, month)
             
@@ -525,7 +545,7 @@ def create_activity_calendar(df_filtered, activity_cols):
 
 
 def show_athlete_dashboard(athlete_id):
-    st.title(f"Dashboard - {athlete_id}")
+    st.title(f"Tableau de bord - {athlete_id}")
     df = load_athlete_data(athlete_id)
     if df.empty:
         st.warning("Aucune donnée disponible pour cet athlète.")
@@ -539,7 +559,7 @@ def show_athlete_dashboard(athlete_id):
         'Pratique': 'Pratique load',
         'Sport': 'Sport load',
         'Match': 'Match load',
-        'Skills': 'Skills load'
+        'Habiletés': 'Skills load'
     }
     activity_cols = {label: col for label, col in activity_map.items() if col in df.columns}
 
@@ -557,7 +577,7 @@ def show_athlete_dashboard(athlete_id):
     
     # Afficher l'information sur la date limite
     if max_data_date:
-        st.info(f"📅 Données disponibles jusqu'au **{max_data_date.strftime('%d %B %Y')}**")
+        st.info(f"📅 Données disponibles jusqu'au **{format_date_fr(max_data_date)}**")
     
     col1, col2 = st.columns(2)
     with col1:
@@ -594,7 +614,7 @@ def show_athlete_dashboard(athlete_id):
         st.subheader("Charge par Activité")
         if activity_cols:
             # Exclure les sous-catégories de hockey
-            main_activity_cols_line = {label: col for label, col in activity_cols.items() if label not in ['Skills', 'Pratique', 'Match']}
+            main_activity_cols_line = {label: col for label, col in activity_cols.items() if label not in ['Habiletés', 'Pratique', 'Match']}
             
             if main_activity_cols_line:
                 # Convertir les dates en format date uniquement (sans heures)
@@ -643,7 +663,7 @@ def show_athlete_dashboard(athlete_id):
     with col2:
         st.subheader("Charge Totale")
         # Exclure les sous-catégories de hockey
-        main_activity_cols = {label: col for label, col in activity_cols.items() if label not in ['Skills', 'Pratique', 'Match']}
+        main_activity_cols = {label: col for label, col in activity_cols.items() if label not in ['Habiletés', 'Pratique', 'Match']}
         
         if main_activity_cols:
             total_activity = df_filtered[list(main_activity_cols.values())].sum().reset_index()
@@ -667,7 +687,7 @@ def show_athlete_dashboard(athlete_id):
     st.subheader("Légende des Couleurs")
     
     # Créer une légende avec les couleurs utilisées (exclure les sous-catégories et Repos)
-    main_activities = {k: v for k, v in COLOR_PALETTE.items() if k not in ['Skills', 'Pratique', 'Match', 'Repos']}
+    main_activities = {k: v for k, v in COLOR_PALETTE.items() if k not in ['Habiletés', 'Pratique', 'Match', 'Repos']}
     legend_cols = st.columns(len(main_activities))
     
     for i, (activity, color) in enumerate(main_activities.items()):
@@ -746,7 +766,8 @@ def show_athlete_dashboard(athlete_id):
 
         for month_index, month_key in enumerate(month_options, start=1):
             month_dates = month_to_dates[month_key]
-            month_title = pd.to_datetime(f"{month_key}-01").strftime('%B %Y').capitalize()
+            month_dt = pd.to_datetime(f"{month_key}-01")
+            month_title = f"{FRENCH_MONTHS[month_dt.month]} {month_dt.year}"
             st.markdown(f"**{month_title}**")
 
             day_labels = [d.strftime('%d') for d in month_dates]
@@ -845,7 +866,7 @@ def show_athlete_dashboard(athlete_id):
         )
 
 def show_coach_dashboard():
-    st.title("Dashboard Coach - Tous les Athlètes")
+    st.title("Tableau de bord coach - Tous les athlètes")
     if not os.path.exists(file_path):
         st.error("Fichier de données non trouvé.")
         return
@@ -995,7 +1016,15 @@ authenticator = stauth.Authenticate(
 )
 
 try:
-    authenticator.login('main')
+    authenticator.login(
+        'main',
+        fields={
+            'Form name': 'Connexion',
+            'Username': "Nom d'utilisateur",
+            'Password': 'Mot de passe',
+            'Login': 'Se connecter'
+        }
+    )
 except Exception as exc:
     # Happens when an old cookie refers to a user not present/authorized anymore.
     if 'User not authorized' in str(exc):
@@ -1006,7 +1035,7 @@ except Exception as exc:
         st.session_state['authentication_status'] = None
         st.session_state.pop('username', None)
         st.session_state.pop('name', None)
-        st.warning('Session invalide detectee. Reconnecte-toi.')
+        st.warning('Session invalide détectée. Reconnecte-toi.')
     else:
         raise
 
@@ -1015,8 +1044,8 @@ name = st.session_state.get('name')
 username = st.session_state.get('username')
 
 if authentication_status:
-    authenticator.logout('Logout', 'main')
-    st.write(f'Welcome *{name}*')
+    authenticator.logout('Se déconnecter', 'main')
+    st.write(f'Bienvenue *{name}*')
     user_role = users['usernames'][username]['role']
     if user_role == 'athlete':
         athlete_id = users['usernames'][username]['id']
@@ -1026,6 +1055,6 @@ if authentication_status:
     elif user_role in ['admin', 'data_manager']:
         show_admin_dashboard()
 elif authentication_status == False:
-    st.error('Username/password is incorrect')
+    st.error("Nom d'utilisateur ou mot de passe incorrect")
 elif authentication_status is None:
-    st.warning('Please enter your username and password')
+    st.warning("Veuillez entrer votre nom d'utilisateur et votre mot de passe")
