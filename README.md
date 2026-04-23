@@ -20,8 +20,6 @@ Application Streamlit pour visualiser les charges de travail des athlètes, avec
 - Les athlètes peuvent créer leur propre mot de passe depuis la barre latérale
 - Les comptes `admin` / `data_manager` peuvent importer de nouvelles données via l'interface d'administration
 
-Compte admin d'exemple dans `data/credentials/users.csv`:
-- `admin` / `adminpass`
 
 ## Sécurité et Conformité Loi 25
 
