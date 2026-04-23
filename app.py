@@ -8,6 +8,8 @@ import hashlib
 import hmac
 import time
 import json
+import tomllib
+from pathlib import Path
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import plotly.express as px
@@ -15,6 +17,7 @@ import plotly.graph_objects as go
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Wedge, Circle
+from collections.abc import Mapping
 
 # Configuration de la page
 st.set_page_config(layout="wide", page_title="Dashboard Entraînement")
@@ -25,10 +28,13 @@ COLOR_PALETTE = {
     'Cardio': '#4ECDC4',      # Turquoise
     'Hockey': '#45B7D1',      # Bleu principal
     'Sport': '#FFA07A',       # Orange
-    'Habiletés': '#7FB3D5',   # Bleu clair (nuance de Hockey)
+    'Skills': '#7FB3D5',      # Bleu clair (nuance de Hockey)
     'Pratique': '#2E86AB',    # Bleu moyen (nuance de Hockey)
     'Match': '#1B4F72',       # Bleu foncé (nuance de Hockey)
-    'Repos': '#E0E0E0'        # Gris
+    'Repos': '#E0E0E0',       # Gris
+    'Blessure': '#C0392B',    # Rouge foncé
+    'Vacances': '#27AE60',    # Vert
+    'Manque de temps': '#95A5A6',  # Gris moyen
 }
 
 FRENCH_MONTHS = {
@@ -46,11 +52,54 @@ FRENCH_MONTHS = {
     12: 'Décembre'
 }
 
+# Mapping codes Qualtrics (après déduplication pandas) → noms de variables internes
+# La 2e occurrence de Q32 devient Q32.1 quand pandas lit le fichier avec header=0
+QUALTRICS_Q_TO_VAR = {
+    'Q32':    'Id',                                     # Nom de l'athlète
+    'Q43_1':  'Date',
+    'Q27':    'Activités',
+    'Q4':     'Entraînement sur glace',
+    'Q5_1':   'Intensité (entraînement sur glace)',
+    'Q6_1':   'Durée (entraînement sur glace)',
+    'Q20':    'Skills coach (entraînement sur glace)',
+    'Q32.1':  'Musculation',                            # 2e occurrence de Q32
+    'Q8_1':   'Intensité (musculation)',
+    'Q9_1':   'Durée (musculation)',
+    'Q21':    'Skills coach (musculation)',
+    'Q31':    'Match',
+    'Q29_1':  'Intensité (match)',
+    'Q28_1':  'Durée (match)',
+    'Q22':    'Skills',
+    'Q24_1':  'Intensité (skills)',
+    'Q25_1':  'Durée (skills)',
+    'Q26':    'Skills coach (skills)',
+    'Q33':    'Cardio',
+    'Q34_1':  'Intensité (cardio)',
+    'Q35_1':  'Durée (cardio)',
+    'Q14_1':  'Douleur',
+    'Q15':    'Localisation (douleur)',
+    'Q16':    'Autres sports',
+    'Q17':    'Précisez le sport',
+    'Q18_1':  'Intensité (autres sports)',
+    'Q19_1':  'Durée (autres sports)',
+}
+
+# Paires (colonne durée, colonne intensité, nom de la colonne charge calculée)
+ACTIVITY_LOAD_PAIRS = [
+    ('Durée (entraînement sur glace)', 'Intensité (entraînement sur glace)', 'Pratique load'),
+    ('Durée (musculation)',            'Intensité (musculation)',             'Muscu load'),
+    ('Durée (match)',                  'Intensité (match)',                   'Match load'),
+    ('Durée (skills)',                 'Intensité (skills)',                  'Skills load'),
+    ('Durée (cardio)',                 'Intensité (cardio)',                  'Cardio load'),
+    ('Durée (autres sports)',          'Intensité (autres sports)',           'Sport load'),
+]
+
 # Configuration des utilisateurs
 # En production, utiliser une base de données sécurisée et une gestion des rôles centralisée
 PRIVATE_DATA_DIR = 'private_data'
 
 
+# Détermine où lire/écrire les données de l'application.
 def resolve_data_root():
     # Priorité: variable d'environnement > private_data
     env_data_dir = os.getenv('APP_DATA_DIR')
@@ -63,6 +112,7 @@ DATA_ROOT = resolve_data_root()
 AUTH_COOKIE_KEY = os.getenv('APP_AUTH_COOKIE_KEY', 'workout_dashboard_cookie_key_change_me_2026_32_plus_chars')
 
 # Configuration SMTP — priorité: st.secrets > variables d'environnement
+# Récupère une variable de config depuis st.secrets ou les variables d'environnement.
 def _secret(key, default=''):
     try:
         return st.secrets.get(key, os.getenv(key, default))
@@ -78,6 +128,56 @@ APP_BASE_URL  = _secret('APP_BASE_URL', 'http://localhost:8501')
 RESET_TOKEN_SECRET = _secret('APP_RESET_TOKEN_SECRET', AUTH_COOKIE_KEY)
 RESET_TOKEN_EXPIRY = 1800  # 30 minutes
 
+
+def _read_local_streamlit_secrets():
+    """Lit le fichier local .streamlit/secrets.toml (prioritaire pour la réidentification)."""
+    try:
+        local_path = Path(__file__).resolve().parent / '.streamlit' / 'secrets.toml'
+        if local_path.exists():
+            return tomllib.loads(local_path.read_text(encoding='utf-8'))
+    except Exception:
+        pass
+    return {}
+
+
+def _get_reid_secret_key():
+    local = _read_local_streamlit_secrets()
+    local_key = local.get('APP_REID_SECRET_KEY', '')
+    if isinstance(local_key, str) and local_key.strip():
+        return local_key.strip()
+    return _secret('APP_REID_SECRET_KEY', '')
+
+
+def _load_reid_codebook():
+    """
+    Charge un codebook de réidentification depuis APP_REID_CODEBOOK.
+    Formats acceptés:
+      - dict dans st.secrets
+      - JSON string via variable d'environnement/secrets
+    Exemple JSON: {"athlete_001": "CODE-ALPHA", "athlete_002": "CODE-BETA"}
+    """
+    local = _read_local_streamlit_secrets()
+    local_value = local.get('APP_REID_CODEBOOK', '')
+    if isinstance(local_value, Mapping):
+        return {str(k).strip(): str(v) for k, v in local_value.items()}
+
+    raw_value = _secret('APP_REID_CODEBOOK', '')
+    if isinstance(raw_value, Mapping):
+        return {str(k).strip(): str(v) for k, v in raw_value.items()}
+    if hasattr(raw_value, 'items'):
+        try:
+            return {str(k).strip(): str(v) for k, v in raw_value.items()}
+        except Exception:
+            pass
+    if isinstance(raw_value, str) and raw_value.strip():
+        try:
+            parsed = json.loads(raw_value)
+            if isinstance(parsed, Mapping):
+                return {str(k).strip(): str(v) for k, v in parsed.items()}
+        except Exception:
+            return {}
+    return {}
+
 CREDENTIALS_FOLDER = os.path.join(DATA_ROOT, 'credentials')
 CREDENTIALS_XLSX = os.path.join(CREDENTIALS_FOLDER, 'users.xlsx')
 CREDENTIALS_CSV = os.path.join(CREDENTIALS_FOLDER, 'users.csv')
@@ -90,6 +190,7 @@ DEFAULT_USERS = {
 file_path = os.path.join(DATA_ROOT, 'Activités.xlsx') if os.path.exists(os.path.join(DATA_ROOT, 'Activités.xlsx')) else os.path.join(DATA_ROOT, 'trainings.xlsx')
 
 
+# Trouve une colonne en essayant plusieurs noms possibles (égalité stricte puis partielle).
 def find_column(columns, choices):
     for choice in choices:
         for col in columns:
@@ -102,11 +203,92 @@ def find_column(columns, choices):
     return None
 
 
+# Masque un identifiant athlète de manière stable pour l'affichage admin.
+def mask_athlete_identifier(value):
+    if pd.isna(value):
+        return ''
+    raw = str(value).strip()
+    if not raw:
+        return ''
+    codebook = _load_reid_codebook()
+    if raw in codebook:
+        return codebook[raw]
+    raw_lower = raw.lower()
+    for key, mapped_value in codebook.items():
+        if str(key).strip().lower() == raw_lower:
+            return mapped_value
+    reid_secret_key = _get_reid_secret_key()
+    if reid_secret_key:
+        digest = hmac.new(reid_secret_key.encode('utf-8'), raw.encode('utf-8'), hashlib.sha256).hexdigest()[:10].upper()
+        return f"RID_{digest}"
+    digest = hashlib.sha256(raw.encode('utf-8')).hexdigest()[:8].upper()
+    return f"ATHLETE_{digest}"
+
+
+# Retourne une copie du DataFrame avec la colonne Id (ou équivalent) anonymisée pour l'admin.
+def anonymize_athlete_column_for_admin(df):
+    df_display = df.copy()
+    athlete_col = find_column(df_display.columns, ['Id', 'athlete_id', 'utilisateur', 'Utilisateur'])
+    if athlete_col is not None:
+        df_display[athlete_col] = df_display[athlete_col].apply(mask_athlete_identifier)
+    return df_display, athlete_col
+
+
+# Détecte un export Qualtrics brut via la première cellule d'en-tête.
+def is_qualtrics_format(df_raw):
+    """Détecte si le DataFrame brut est un export Qualtrics (première cellule = 'StartDate')."""
+    if df_raw.empty:
+        return False
+    return str(df_raw.iloc[0, 0]).strip() == 'StartDate'
+
+
+# Convertit un export Qualtrics vers le format interne exploité par le dashboard.
+def parse_qualtrics_df(df):
+    """
+    Transforme un DataFrame Qualtrics (codes Q en colonnes, ligne de libellés déjà ignorée)
+    en DataFrame normalisé avec noms de variables et colonnes de charge calculées.
+    Filtre les réponses de prévisualisation (Status contenant 'preview').
+    """
+    # Supprimer les lignes de prévisualisation Qualtrics
+    if 'Status' in df.columns:
+        df = df[~df['Status'].astype(str).str.lower().str.contains('preview', na=False)].copy()
+    else:
+        df = df.copy()
+
+    # Renommer les colonnes selon le mapping Q-code → variable interne
+    rename_map = {k: v for k, v in QUALTRICS_Q_TO_VAR.items() if k in df.columns}
+    df = df.rename(columns=rename_map)
+
+    # Calculer les charges : charge = durée × intensité pour chaque activité
+    for dur_col, int_col, load_col in ACTIVITY_LOAD_PAIRS:
+        if dur_col in df.columns and int_col in df.columns:
+            dur   = pd.to_numeric(df[dur_col],  errors='coerce').fillna(0)
+            inten = pd.to_numeric(df[int_col], errors='coerce').fillna(0)
+            df[load_col] = dur * inten
+
+    # Hockey load = somme des sous-activités sur glace (Pratique + Match + Skills)
+    hockey_parts = [c for c in ['Pratique load', 'Match load', 'Skills load'] if c in df.columns]
+    if hockey_parts:
+        df['Hockey load'] = df[hockey_parts].fillna(0).sum(axis=1)
+
+    # Garder uniquement les colonnes utiles pour l'application
+    keep_cols = (
+        list(QUALTRICS_Q_TO_VAR.values())
+        + ['Pratique load', 'Muscu load', 'Match load', 'Skills load',
+           'Cardio load', 'Sport load', 'Hockey load']
+    )
+    df = df[[c for c in keep_cols if c in df.columns]]
+
+    return df
+
+
+# Formate une date au format lisible en français.
 def format_date_fr(value):
     dt = pd.to_datetime(value)
     return f"{dt.day:02d} {FRENCH_MONTHS[dt.month]} {dt.year}"
 
 
+# Charge le fichier de comptes (CSV prioritaire, XLSX en fallback).
 def read_credentials_df():
     if os.path.exists(CREDENTIALS_CSV):
         return pd.read_csv(CREDENTIALS_CSV)
@@ -119,10 +301,12 @@ def read_credentials_df():
     return None
 
 
+# Vérifie si un mot de passe est déjà hashé (bcrypt).
 def is_hashed_password(password):
     return isinstance(password, str) and password.startswith(('$2a$', '$2b$', '$2y$'))
 
 
+# Construit la structure d'identifiants attendue par streamlit-authenticator.
 def load_user_credentials():
     df = read_credentials_df()
     if df is not None and not df.empty:
@@ -164,6 +348,7 @@ def load_user_credentials():
 users = load_user_credentials()
 
 
+# Écrit les comptes utilisateurs dans le fichier CSV sécurisé.
 def write_credentials_df(df):
     os.makedirs(CREDENTIALS_FOLDER, exist_ok=True)
     try:
@@ -173,6 +358,7 @@ def write_credentials_df(df):
         return False
 
 
+# Sérialise les identifiants en DataFrame puis les sauvegarde.
 def save_user_credentials(credentials_dict):
     rows = []
     for username, info in credentials_dict['usernames'].items():
@@ -187,6 +373,7 @@ def save_user_credentials(credentials_dict):
     write_credentials_df(df)
 
 
+# Sauvegarde le fichier principal de données (XLSX ou CSV selon extension).
 def save_data_file(df):
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
     try:
@@ -199,6 +386,7 @@ def save_data_file(df):
         return False
 
 
+# Lit la date limite de disponibilité des données (metadata/max_date.txt).
 def load_max_data_date():
     """Charge la date max des données disponibles"""
     metadata_file = os.path.join(DATA_ROOT, 'metadata', 'max_date.txt')
@@ -212,6 +400,7 @@ def load_max_data_date():
     return None
 
 
+# Persiste la date limite de disponibilité des données.
 def save_max_data_date(date_obj):
     """Sauvegarde la date max des données disponibles"""
     os.makedirs(os.path.join(DATA_ROOT, 'metadata'), exist_ok=True)
@@ -224,6 +413,7 @@ def save_max_data_date(date_obj):
         return False
 
 
+# Supprime les doublons basés sur la clé composite (Id + Date).
 def deduplicate_data(df, existing_df=None):
     """
     Déduplique les données basées sur (Id, Date).
@@ -254,6 +444,7 @@ def deduplicate_data(df, existing_df=None):
     return df, duplicates
 
 
+# Normalise un fichier importé pour garantir les colonnes Id et Date.
 def normalize_uploaded_data(df):
     date_col = find_column(df.columns, ['date', 'Date'])
     athlete_id_col = find_column(df.columns, ['athlete_id', 'Id', 'utilisateur', 'Utilisateur'])
@@ -266,12 +457,17 @@ def normalize_uploaded_data(df):
         df = df.rename(columns={athlete_id_col: 'Id'})
 
     df['Date'] = pd.to_datetime(df['Date'], format='mixed', errors='coerce')
-    if df['Date'].isna().any():
-        return None, None, 'Certaines dates sont invalides. Vérifie le format de la colonne date.'
+    invalid_count = df['Date'].isna().sum()
+    if invalid_count > 0:
+        df = df.dropna(subset=['Date'])
+        if df.empty:
+            return None, None, 'Toutes les dates sont invalides. Vérifie le format de la colonne date.'
+        st.info(f"ℹ️ {invalid_count} ligne(s) sans date valide ignorée(s).")
 
     return df, 'Id', None
 
 
+# Ajoute un nouvel utilisateur au fichier de comptes.
 def append_user_to_file(email, name, password, role, athlete_id):
     email = str(email).strip()
     if not email:
@@ -304,6 +500,7 @@ def append_user_to_file(email, name, password, role, athlete_id):
     return True, None
 
 
+# Met à jour le mot de passe d'un utilisateur existant.
 def update_password_in_file(email, password):
     email = str(email).strip()
     if not os.path.exists(CREDENTIALS_CSV) and not os.path.exists(CREDENTIALS_XLSX):
@@ -328,6 +525,7 @@ def update_password_in_file(email, password):
 
 # ── Gestion des tokens de réinitialisation par courriel ──────────────────────
 
+# Récupère les informations d'authentification minimales d'un utilisateur.
 def _get_user_auth_record(email):
     df = read_credentials_df()
     if df is None or df.empty:
@@ -350,19 +548,23 @@ def _get_user_auth_record(email):
     }
 
 
+# Encode des octets au format Base64 URL-safe.
 def _b64url_encode(data):
     return base64.urlsafe_b64encode(data).decode('utf-8').rstrip('=')
 
 
+# Décode une chaîne Base64 URL-safe.
 def _b64url_decode(data):
     padding = '=' * (-len(data) % 4)
     return base64.urlsafe_b64decode(data + padding)
 
 
+# Calcule une empreinte courte du hash de mot de passe pour invalider les tokens anciens.
 def _password_fingerprint(password_hash):
     return hashlib.sha256(password_hash.encode('utf-8')).hexdigest()[:16]
 
 
+# Génère un token de réinitialisation signé et expirant.
 def generate_reset_token(email):
     user_record = _get_user_auth_record(email)
     if user_record is None:
@@ -382,6 +584,7 @@ def generate_reset_token(email):
     return f"{_b64url_encode(payload_bytes)}.{_b64url_encode(signature)}"
 
 
+# Vérifie l'authenticité, la validité temporelle et la cohérence du token.
 def verify_reset_token(token):
     try:
         payload_part, signature_part = str(token).split('.', 1)
@@ -417,11 +620,13 @@ def verify_reset_token(token):
     return user_record['email']
 
 
+# Placeholder: les tokens sont stateless et expirent via la signature/empreinte.
 def consume_reset_token(token):
     # Token stateless: après changement de mot de passe, il devient invalide automatiquement.
     return None
 
 
+# Envoie le courriel de réinitialisation de mot de passe.
 def send_reset_email(to_email, token):
     if not SMTP_USER or not SMTP_PASSWORD:
         return False, 'smtp_non_configure'
@@ -440,7 +645,7 @@ def send_reset_email(to_email, token):
         f"Ce lien est valide pendant 30 minutes et ne peut être utilisé qu'une seule fois :\n\n"
         f"{reset_url}\n\n"
         f"Si vous n'avez pas fait cette demande, ignorez simplement ce courriel.\n\n"
-        f"L'équipe Dashboard Entraînement"
+        f"L'équipe Hockey Lab"
     )
     msg.attach(MIMEText(corps, 'plain', 'utf-8'))
 
@@ -510,6 +715,7 @@ with st.sidebar.expander('Mot de passe oublié'):
                                 st.success('Si ce courriel est associé à un compte, un lien de réinitialisation a été envoyé (valide 30 minutes).')
                     else:
                         st.success('Si ce courriel est associé à un compte, un lien de réinitialisation a été envoyé (valide 30 minutes).')
+# Charge et prépare les données d'un athlète pour le dashboard.
 def load_athlete_data(athlete_id):
     if not os.path.exists(file_path):
         st.error("Fichier de données non trouvé.")
@@ -533,30 +739,78 @@ def load_athlete_data(athlete_id):
     df['Date'] = pd.to_datetime(df['Date'], format='mixed', errors='coerce')
     df = df.dropna(subset=['Date'])
 
-    if 'Total load' in df.columns:
-        df['charge_totale'] = df['Total load']
+    # Calculer Hockey load à partir des sous-activités s'il est absent
+    hockey_sub = [c for c in ['Pratique load', 'Match load', 'Skills load'] if c in df.columns]
+    if hockey_sub and 'Hockey load' not in df.columns:
+        df['Hockey load'] = df[hockey_sub].fillna(0).sum(axis=1)
+
+    # Toujours recalculer depuis les colonnes individuelles (Total load peut être NaN)
+    # Insensible à la casse et exclut Hockey load pour éviter le double comptage
+    load_cols = [c for c in df.columns if c.lower().endswith('load')
+                 and c not in ['Total load', 'charge_totale', 'Hockey load']]
+    if load_cols:
+        df['charge_totale'] = df[load_cols].fillna(0).sum(axis=1)
     else:
-        load_cols = [c for c in df.columns if c.endswith('load') and c not in ['Total load', 'charge_totale']]
-        if load_cols:
-            df['charge_totale'] = df[load_cols].sum(axis=1)
-        else:
-            df['charge_totale'] = 0
+        df['charge_totale'] = 0
 
     return df
 
 
+# Calcule la monotonie: moyenne mobile 7 jours / écart-type mobile 7 jours.
 def calculate_monotony(df):
     if df.empty:
-        return 0
-    daily_load = df.groupby('Date')['charge_totale'].sum()
-    rolling_mean = daily_load.rolling(7).mean()
-    rolling_std = daily_load.rolling(7).std()
-    monotony = rolling_mean / rolling_std
-    # Retourner la dernière valeur valide
-    if monotony.empty or pd.isna(monotony.iloc[-1]):
-        return 0
-    return monotony.iloc[-1]
+        return float('nan')
+    # Normaliser la date (supprimer la composante horaire) pour grouper par jour calendaire
+    df = df.copy()
+    df['_date'] = pd.to_datetime(df['Date']).dt.normalize()
+    daily_load = df.groupby('_date')['charge_totale'].sum()
 
+    # Remplir les jours calendaires manquants (sans soumission) avec 0
+    if len(daily_load) >= 2:
+        full_range = pd.date_range(daily_load.index.min(), daily_load.index.max(), freq='D')
+        daily_load = daily_load.reindex(full_range, fill_value=0)
+
+    if len(daily_load) < 7:
+        return float('nan')
+
+    rolling_mean = daily_load.rolling(7).mean()
+    rolling_std  = daily_load.rolling(7).std()
+
+    # Éviter la division par 0 (écart-type nul)
+    safe_std = rolling_std.where(rolling_std > 0, other=float('nan'))
+    monotony = rolling_mean / safe_std
+
+    valid = monotony.dropna()
+    if valid.empty:
+        return float('nan')
+    return float(valid.iloc[-1])
+
+
+# Calcule l'AWCR: charge aiguë (7j) / (charge chronique (28j) / 4).
+def calculate_awcr(df):
+    if df.empty:
+        return float('nan')
+
+    df = df.copy()
+    df['_date'] = pd.to_datetime(df['Date']).dt.normalize()
+    daily_load = df.groupby('_date')['charge_totale'].sum()
+
+    if len(daily_load) >= 2:
+        full_range = pd.date_range(daily_load.index.min(), daily_load.index.max(), freq='D')
+        daily_load = daily_load.reindex(full_range, fill_value=0)
+
+    if len(daily_load) < 28:
+        return float('nan')
+
+    acute_load = daily_load.tail(7).sum()
+    chronic_load = daily_load.tail(28).sum() / 4
+
+    if chronic_load <= 0:
+        return float('nan')
+
+    return float(acute_load / chronic_load)
+
+# Traduit la monotonie en message clinique simple et code couleur.
 def interpret_monotony(monotony_value):
     """Interprète la valeur de monotonie et retourne (texte, couleur, emoji)"""
     if monotony_value == float('inf') or pd.isna(monotony_value):
@@ -567,11 +821,64 @@ def interpret_monotony(monotony_value):
     elif monotony_value < 2.0:
         return "Normal ✓", "#4ECDC4", "•"
     elif monotony_value < 2.5:
-        return "⚠️ Risque (trop répétitif)", "#FFA500", "!"
+        return "⚠️ Répétitif", "#FFA500", "!"
     else:
-        return "🔥 Risque élevé (blessure/fatigue)", "#DC3545", "!"
+        return "🔥 Trop répétitif", "#DC3545", "!"
 
 
+# Traduit l'AWCR en niveau de risque et code couleur.
+def interpret_awcr(awcr_value):
+    if pd.isna(awcr_value) or awcr_value == float('inf'):
+        return "Données insuffisantes", "#FFA500", "⚠️"
+
+    if awcr_value < 0.8:
+        return "Charge faible", "#28A745", "↓"
+    elif awcr_value <= 1.3:
+        return "Zone cible", "#4ECDC4", "✓"
+    elif awcr_value <= 1.5:
+        return "Charge élevée", "#FFA500", "!"
+    else:
+        return "Risque accru", "#DC3545", "!"
+
+
+# Dessine une jauge demi-cercle paramétrable (zones colorées + aiguille).
+def render_semicircle_gauge(title, value, zones, vmax, tick_values):
+    gauge_value = max(0.0, min(float(value), float(vmax)))
+
+    def value_to_angle(current_value, vmin=0.0, upper=vmax):
+        ratio = (current_value - vmin) / (upper - vmin)
+        return 180 - (ratio * 180)
+
+    fig, ax = plt.subplots(figsize=(6.6, 2.9))
+    ax.set_aspect('equal')
+
+    for start, end, zone_color in zones:
+        theta1 = value_to_angle(end)
+        theta2 = value_to_angle(start)
+        ax.add_patch(Wedge((0, 0), 1.0, theta1, theta2, width=0.24, facecolor=zone_color, edgecolor='white'))
+
+    needle_angle = np.deg2rad(value_to_angle(gauge_value))
+    needle_x = 0.68 * np.cos(needle_angle)
+    needle_y = 0.68 * np.sin(needle_angle)
+    ax.plot([0, needle_x], [0, needle_y], color='#111111', linewidth=2)
+    ax.add_patch(Circle((0, 0), 0.035, color='#111111'))
+
+    for tick in tick_values:
+        tick_angle = np.deg2rad(value_to_angle(tick))
+        x = 1.08 * np.cos(tick_angle)
+        y = 1.08 * np.sin(tick_angle)
+        ax.text(x, y, f"{tick:g}", ha='center', va='center', fontsize=9)
+
+    ax.text(0, -0.10, title, ha='center', va='center', fontsize=10)
+    ax.text(0, 0.20, f"{gauge_value:.2f}", ha='center', va='center', fontsize=18, fontweight='bold')
+
+    ax.set_xlim(-1.2, 1.2)
+    ax.set_ylim(-0.2, 1.2)
+    ax.axis('off')
+    return fig
+
+
+# Retourne l'activité dominante de la journée à partir des charges.
 def get_main_activity(row, activity_cols):
     """Retourne l'activité principale (celle avec la plus grande charge) pour une ligne"""
     activities = {label: row.get(col, 0) for label, col in activity_cols.items()}
@@ -581,6 +888,7 @@ def get_main_activity(row, activity_cols):
     return main if activities[main] > 0 else "Repos"
 
 
+# Liste toutes les activités non nulles d'une journée.
 def get_all_activities(row, activity_cols):
     """Retourne toutes les activités du jour (avec charge > 0)"""
     activities = []
@@ -591,6 +899,24 @@ def get_all_activities(row, activity_cols):
     return activities if activities else ["Repos"]
 
 
+# Convertit la réponse textuelle "Activités" en statut standardisé.
+def _parse_activite_status(value):
+    """Classifie la réponse Q27 en étiquette affichable."""
+    s = str(value).strip().lower()
+    if 'blessure' in s or 'injury' in s or 'injur' in s:
+        return 'Blessure'
+    if 'vacance' in s or 'vacation' in s:
+        return 'Vacances'
+    if 'temps' in s or 'time' in s:
+        return 'Manque de temps'
+    if s.startswith('non') or s.startswith('no '):
+        return 'Repos'
+    if 'repos' in s or 'recov' in s or 'rest' in s:
+        return 'Repos'
+    return None  # Oui / Yes ou NaN → ne rien afficher comme statut de repos
+
+
+# Génère le calendrier mensuel avec activités/stats journalières.
 def create_activity_calendar(df_filtered, activity_cols):
     """Crée un calendrier HTML avec proportions des activités par jour et monotonie"""
     import calendar as cal_module
@@ -608,13 +934,27 @@ def create_activity_calendar(df_filtered, activity_cols):
             charge = row.get(col, 0)
             if charge > 0 and not pd.isna(charge):
                 result[label] = charge
-        return result if result else {'Repos': 1}
+        return result if result else None
     
     df_filtered_sorted = df_filtered.sort_values('Date').copy()
     df_filtered_sorted['Proportions'] = df_filtered_sorted.apply(lambda row: get_proportions(row, calendar_activity_cols), axis=1)
     
-    # Créer un dictionnaire date -> proportions
-    proportion_dict = dict(zip(df_filtered_sorted['Date'].dt.date, df_filtered_sorted['Proportions']))
+    # Créer un dictionnaire date -> proportions (seulement si des charges existent)
+    proportion_dict = {
+        date: props
+        for date, props in zip(df_filtered_sorted['Date'].dt.date, df_filtered_sorted['Proportions'])
+        if props is not None
+    }
+
+    # Dictionnaire date -> statut de repos (Repos / Blessure / Vacances / Manque de temps)
+    status_dict = {}
+    if 'Activités' in df_filtered_sorted.columns:
+        for _, row in df_filtered_sorted.iterrows():
+            val = row.get('Activités', None)
+            if pd.notna(val):
+                status = _parse_activite_status(val)
+                if status:
+                    status_dict[row['Date'].date()] = status
     
     # Pré-calculer la monotonie cumulée jusqu'à chaque date
     monotony_dict = {}
@@ -692,15 +1032,33 @@ def create_activity_calendar(df_filtered, activity_cols):
                                     unsafe_allow_html=True
                                 )
                             else:
-                                st.markdown(
-                                    f"""
-                                    <div style="background-color: #F5F5F5; padding: 8px; border-radius: 5px; text-align: center; min-height: 80px; display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; border: 1px solid #E0E0E0;">
-                                        <span style="font-size: 12px; font-weight: bold; color: #666; margin-bottom: 4px;">{day}</span>
-                                        <span style="font-size: 9px; color: #999;">Aucune réponse</span>
-                                    </div>
-                                    """,
-                                    unsafe_allow_html=True
-                                )
+                                day_status = status_dict.get(date_obj, None)
+                                if day_status:
+                                    status_color = color_map.get(day_status, '#E0E0E0')
+                                    text_color = '#FFFFFF' if day_status in ('Blessure', 'Vacances') else '#555555'
+                                    # Icône selon le statut
+                                    icons = {'Blessure': '🩹', 'Vacances': '🌴', 'Manque de temps': '⏱️', 'Repos': '😴'}
+                                    icon = icons.get(day_status, '•')
+                                    st.markdown(
+                                        f"""
+                                        <div style="background-color: {status_color}; padding: 8px; border-radius: 5px; text-align: center; min-height: 80px; display: flex; flex-direction: column; align-items: center; justify-content: center; border: 1px solid {status_color};">
+                                            <span style="font-size: 12px; font-weight: bold; color: {text_color}; margin-bottom: 4px;">{day}</span>
+                                            <span style="font-size: 16px;">{icon}</span>
+                                            <span style="font-size: 8px; color: {text_color}; font-weight: 600; margin-top: 2px;">{day_status}</span>
+                                        </div>
+                                        """,
+                                        unsafe_allow_html=True
+                                    )
+                                else:
+                                    st.markdown(
+                                        f"""
+                                        <div style="background-color: #F5F5F5; padding: 8px; border-radius: 5px; text-align: center; min-height: 80px; display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; border: 1px solid #E0E0E0;">
+                                            <span style="font-size: 12px; font-weight: bold; color: #666; margin-bottom: 4px;">{day}</span>
+                                            <span style="font-size: 9px; color: #999;">Aucune réponse</span>
+                                        </div>
+                                        """,
+                                        unsafe_allow_html=True
+                                    )
         
         # Passer au mois suivant
         if month == 12:
@@ -709,8 +1067,9 @@ def create_activity_calendar(df_filtered, activity_cols):
             current = current.replace(month=month+1)
 
 
+# Affiche le dashboard complet d'un athlète (graphiques, jauges, calendrier).
 def show_athlete_dashboard(athlete_id):
-    st.title(f"Tableau de bord - {athlete_id}")
+    st.title(f"Tableau de bord - {name}")
     df = load_athlete_data(athlete_id)
     if df.empty:
         st.warning("Aucune donnée disponible pour cet athlète.")
@@ -724,7 +1083,7 @@ def show_athlete_dashboard(athlete_id):
         'Pratique': 'Pratique load',
         'Sport': 'Sport load',
         'Match': 'Match load',
-        'Habiletés': 'Skills load'
+        'Skills': 'Skills load'
     }
     activity_cols = {label: col for label, col in activity_map.items() if col in df.columns}
 
@@ -779,7 +1138,7 @@ def show_athlete_dashboard(athlete_id):
         st.subheader("Charge par Activité")
         if activity_cols:
             # Exclure les sous-catégories de hockey
-            main_activity_cols_line = {label: col for label, col in activity_cols.items() if label not in ['Habiletés', 'Pratique', 'Match']}
+            main_activity_cols_line = {label: col for label, col in activity_cols.items() if label not in ['Skills', 'Pratique', 'Match']}
             
             if main_activity_cols_line:
                 # Convertir les dates en format date uniquement (sans heures)
@@ -828,12 +1187,14 @@ def show_athlete_dashboard(athlete_id):
     with col2:
         st.subheader("Charge Totale")
         # Exclure les sous-catégories de hockey
-        main_activity_cols = {label: col for label, col in activity_cols.items() if label not in ['Habiletés', 'Pratique', 'Match']}
+        main_activity_cols = {label: col for label, col in activity_cols.items() if label not in ['Skills', 'Pratique', 'Match']}
         
         if main_activity_cols:
             total_activity = df_filtered[list(main_activity_cols.values())].sum().reset_index()
             total_activity.columns = ['charge_column', 'Charge']
             total_activity['Activité'] = total_activity['charge_column'].map({v: k for k, v in main_activity_cols.items()})
+            # Exclure les activités avec charge nulle ou négative
+            total_activity = total_activity[total_activity['Charge'] > 0]
             
             # Définir les couleurs pour chaque activité
             color_map = {k: v for k, v in COLOR_PALETTE.items() if k in total_activity['Activité'].values}
@@ -851,28 +1212,29 @@ def show_athlete_dashboard(athlete_id):
     # Légende commune pour les graphiques du haut
     st.subheader("Légende des Couleurs")
     
-    # Créer une légende avec les couleurs utilisées (exclure les sous-catégories et Repos)
-    main_activities = {k: v for k, v in COLOR_PALETTE.items() if k not in ['Habiletés', 'Pratique', 'Match', 'Repos']}
+    # Activités uniquement (exclure sous-catégories Hockey et statuts de non-entraînement)
+    main_activities = {k: v for k, v in COLOR_PALETTE.items() if k not in ['Skills', 'Pratique', 'Match', 'Repos', 'Blessure', 'Vacances', 'Manque de temps']}
     legend_cols = st.columns(len(main_activities))
-    
     for i, (activity, color) in enumerate(main_activities.items()):
-            with legend_cols[i % len(legend_cols)]:
-                st.markdown(
-                    f'<div style="display: flex; align-items: center; margin-bottom: 5px;">'
-                    f'<div style="width: 20px; height: 20px; background-color: {color}; border-radius: 3px; margin-right: 8px;"></div>'
-                    f'<span style="font-size: 14px;">{activity}</span>'
-                    f'</div>',
-                    unsafe_allow_html=True
-                )
+        with legend_cols[i % len(legend_cols)]:
+            st.markdown(
+                f'<div style="display: flex; align-items: center; margin-bottom: 5px;">'
+                f'<div style="width: 20px; height: 20px; background-color: {color}; border-radius: 3px; margin-right: 8px;"></div>'
+                f'<span style="font-size: 14px;">{activity}</span>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
 
     st.divider()
 
     st.subheader("Monotonie")
     all_monotony_dates = sorted(df['Date'].dt.date.unique().tolist())
     monotony_by_date = {}
+    awcr_by_date = {}
     for date_value in all_monotony_dates:
         df_until_date = df[df['Date'].dt.date <= date_value]
         monotony_by_date[date_value] = calculate_monotony(df_until_date)
+        awcr_by_date[date_value] = calculate_awcr(df_until_date)
 
     # Sélecteur horizontal de dates (stable, sans reset sur clic)
     def monotony_symbol(value):
@@ -888,12 +1250,23 @@ def show_athlete_dashboard(athlete_id):
 
     def monotony_zone_color(value):
         if value == float('inf') or pd.isna(value):
-            return '#FFA500'
+            return '#9E9E9E'
         if value < 1.0:
             return '#28A745'
         if value < 2.0:
             return '#4ECDC4'
         if value < 2.5:
+            return '#FFA500'
+        return '#DC3545'
+
+    def awcr_zone_color(value):
+        if pd.isna(value) or value == float('inf'):
+            return '#9E9E9E'
+        if value < 0.8:
+            return '#28A745'
+        if value <= 1.3:
+            return '#4ECDC4'
+        if value <= 1.5:
             return '#FFA500'
         return '#DC3545'
 
@@ -964,64 +1337,44 @@ def show_athlete_dashboard(athlete_id):
             )
 
             for option_index, d in enumerate(month_dates, start=2):
-                zone_color = monotony_zone_color(monotony_by_date.get(d, 0))
+                mono_color = monotony_zone_color(monotony_by_date.get(d, float('nan')))
+                awcr_color = awcr_zone_color(awcr_by_date.get(d, float('nan')))
+                split_bg = f"linear-gradient(90deg, {mono_color} 0%, {mono_color} 50%, {awcr_color} 50%, {awcr_color} 100%)"
                 css_rules.append(
                     "div[role='radiogroup'][aria-label='" + radio_label + "'] > label:nth-child(" + str(option_index) + ") {"
-                    + f"background:{zone_color}; border:1.5px solid {zone_color}; border-radius:8px; padding:1px 7px; margin:0; min-height:unset;"
+                    + f"background:{split_bg}; border:1.5px solid rgba(0,0,0,0.22); border-radius:8px; padding:1px 7px; margin:0; min-height:unset;"
                     + "}"
                 )
 
         st.markdown("<style>" + "".join(css_rules) + "</style>", unsafe_allow_html=True)
 
     monotony_date = st.session_state.selected_monotony_date
-    monotony = monotony_by_date.get(monotony_date, 0)
+    monotony = monotony_by_date.get(monotony_date, float('nan'))
     interpretation, color, emoji = interpret_monotony(monotony)
+    awcr = awcr_by_date.get(monotony_date, float('nan'))
+    awcr_interpretation, awcr_color, awcr_emoji = interpret_awcr(awcr)
 
     with col_gauge:
-        if monotony == float('inf'):
+        st.markdown("**Monotonie**")
+        if pd.isna(monotony):
+            st.metric(f"Monotonie au {monotony_date.isoformat()}", "N/A")
+            st.info("Données insuffisantes pour calculer la monotonie (minimum 7 jours).")
+        elif monotony == float('inf'):
             st.metric(f"Monotonie au {monotony_date.isoformat()}", "∞")
             st.info("La monotonie est infinie (variance nulle sur la fenêtre).")
         else:
-            gauge_value = max(0.0, min(float(monotony), 3.5))
-
-            def value_to_angle(value, vmin=0.0, vmax=3.5):
-                # 0 -> 180 deg (gauche), 3.5 -> 0 deg (droite)
-                ratio = (value - vmin) / (vmax - vmin)
-                return 180 - (ratio * 180)
-
-            fig, ax = plt.subplots(figsize=(6.6, 2.9))
-            ax.set_aspect('equal')
-
-            zones = [
-                (0.0, 1.0, '#28A745'),
-                (1.0, 2.0, '#4ECDC4'),
-                (2.0, 2.5, '#FFA500'),
-                (2.5, 3.5, '#DC3545'),
-            ]
-
-            for start, end, zone_color in zones:
-                theta1 = value_to_angle(end)
-                theta2 = value_to_angle(start)
-                ax.add_patch(Wedge((0, 0), 1.0, theta1, theta2, width=0.24, facecolor=zone_color, edgecolor='white'))
-
-            needle_angle = np.deg2rad(value_to_angle(gauge_value))
-            needle_x = 0.68 * np.cos(needle_angle)
-            needle_y = 0.68 * np.sin(needle_angle)
-            ax.plot([0, needle_x], [0, needle_y], color='#111111', linewidth=3)
-            ax.add_patch(Circle((0, 0), 0.035, color='#111111'))
-
-            for tick in [0.0, 1.0, 2.0, 2.5, 3.5]:
-                tick_angle = np.deg2rad(value_to_angle(tick))
-                x = 1.08 * np.cos(tick_angle)
-                y = 1.08 * np.sin(tick_angle)
-                ax.text(x, y, f"{tick:g}", ha='center', va='center', fontsize=9)
-
-            ax.text(0, -0.10, f"Monotonie au {monotony_date.isoformat()}", ha='center', va='center', fontsize=10)
-            ax.text(0, 0.20, f"{gauge_value:.2f}", ha='center', va='center', fontsize=18, fontweight='bold')
-
-            ax.set_xlim(-1.2, 1.2)
-            ax.set_ylim(-0.2, 1.2)
-            ax.axis('off')
+            fig = render_semicircle_gauge(
+                f"Monotonie au {monotony_date.isoformat()}",
+                monotony,
+                [
+                    (0.0, 1.0, '#28A745'),
+                    (1.0, 2.0, '#4ECDC4'),
+                    (2.0, 2.5, '#FFA500'),
+                    (2.5, 3.5, '#DC3545'),
+                ],
+                3.5,
+                [0.0, 1.0, 2.0, 2.5, 3.5],
+            )
             st.pyplot(fig, width='stretch')
             plt.close(fig)
 
@@ -1030,6 +1383,34 @@ def show_athlete_dashboard(athlete_id):
             unsafe_allow_html=True
         )
 
+        st.markdown("<div style='height: 18px;'></div>", unsafe_allow_html=True)
+        st.markdown("**AWCR**")
+
+        if pd.isna(awcr):
+            st.metric(f"AWCR au {monotony_date.isoformat()}", "N/A")
+            st.info("Données insuffisantes pour calculer l'AWCR (minimum 28 jours).")
+        else:
+            awcr_fig = render_semicircle_gauge(
+                f"AWCR au {monotony_date.isoformat()}",
+                awcr,
+                [
+                    (0.0, 0.8, '#28A745'),
+                    (0.8, 1.3, '#4ECDC4'),
+                    (1.3, 1.5, '#FFA500'),
+                    (1.5, 2.0, '#DC3545'),
+                ],
+                2.0,
+                [0.0, 0.8, 1.3, 1.5, 2.0],
+            )
+            st.pyplot(awcr_fig, width='stretch')
+            plt.close(awcr_fig)
+
+        st.markdown(
+            f"<div style='background-color: {awcr_color}; padding: 10px; border-radius: 8px; color: white; font-weight: 600; text-align: center;'>{awcr_emoji} {awcr_interpretation}</div>",
+            unsafe_allow_html=True
+        )
+
+# Vue coach: sélection d'un athlète puis affichage de son dashboard.
 def show_coach_dashboard():
     st.title("Tableau de bord coach - Tous les athlètes")
     if not os.path.exists(file_path):
@@ -1049,9 +1430,11 @@ def show_coach_dashboard():
         show_athlete_dashboard(selected_athlete)
 
 
+# Vue admin: gestion des utilisateurs, import et édition des données.
 def show_admin_dashboard():
     st.title("Administration des données")
     st.markdown("Importez un fichier Qualtrics ou un fichier de données d'entraînement. Seuls les rôles `admin` ou `data_manager` peuvent importer des données.")
+    st.caption("Identifiants athlètes masqués dans la vue admin. Réidentification possible via les codes définis dans APP_REID_CODEBOOK / APP_REID_SECRET_KEY (secrets).")
     
     # Section Gestion des Utilisateurs
     st.subheader("👥 Gestion des Participants")
@@ -1089,13 +1472,22 @@ def show_admin_dashboard():
             if uploaded_file.name.lower().endswith('.csv'):
                 new_df = pd.read_csv(uploaded_file)
             else:
-                new_df = pd.read_excel(uploaded_file)
+                # Lire la première ligne pour détecter le format Qualtrics
+                df_peek = pd.read_excel(uploaded_file, header=None, nrows=1)
+                uploaded_file.seek(0)
+                if is_qualtrics_format(df_peek):
+                    # Format Qualtrics : ligne 0 = codes Q, ligne 1 = libellés (à ignorer)
+                    new_df = pd.read_excel(uploaded_file, header=0, skiprows=[1])
+                    new_df = parse_qualtrics_df(new_df)
+                else:
+                    new_df = pd.read_excel(uploaded_file)
         except Exception as exc:
             st.error(f"Impossible de lire le fichier : {exc}")
             return
 
         st.write("Aperçu du fichier importé")
-        st.dataframe(new_df.head())
+        preview_df, _ = anonymize_athlete_column_for_admin(new_df.head())
+        st.dataframe(preview_df)
 
         df_normalized, id_column, error = normalize_uploaded_data(new_df)
         if error:
@@ -1122,7 +1514,7 @@ def show_admin_dashboard():
                 activity_cols_report = [c for c in duplicates_found.columns if 'load' in c.lower()]
                 report_rows = []
                 for _, row in duplicates_found.iterrows():
-                    athlete = str(row.get('Id', '?'))
+                    athlete = mask_athlete_identifier(row.get('Id', '?'))
                     date = pd.to_datetime(row.get('Date'), errors='coerce')
                     date_str = date.strftime('%d/%m/%Y') if not pd.isna(date) else '?'
                     activities = [c.replace(' load', '').replace(' Load', '') for c in activity_cols_report if not pd.isna(row.get(c)) and row.get(c, 0) > 0]
@@ -1147,12 +1539,14 @@ def show_admin_dashboard():
     if os.path.exists(file_path):
         try:
             all_data = pd.read_excel(file_path)
+            all_data_admin_view, athlete_col = anonymize_athlete_column_for_admin(all_data)
             
             st.markdown("**Modifier ou supprimer des lignes** : Cochez les cases pour supprimer, éditez les cellules directement, puis cliquez sur **Sauvegarder les modifications**.")
+            st.caption("La colonne identifiant athlète est masquée dans la vue admin pour limiter la divulgation d'information.")
             
             # Tableau éditable avec colonne de sélection pour suppression
             edited_df = st.data_editor(
-                all_data,
+                all_data_admin_view,
                 width='stretch',
                 num_rows="dynamic",
                 key="admin_data_editor"
@@ -1161,7 +1555,17 @@ def show_admin_dashboard():
             col_save, col_info = st.columns([1, 3])
             with col_save:
                 if st.button("💾 Sauvegarder les modifications", key="save_data"):
-                    if save_data_file(edited_df):
+                    restored_df = edited_df.copy()
+
+                    # Restaurer les identifiants réels pour conserver l'intégrité des dashboards.
+                    if athlete_col is not None and athlete_col in restored_df.columns:
+                        if len(restored_df) > len(all_data):
+                            st.error("Ajout de nouvelles lignes désactivé dans la vue anonymisée. Utilise l'import de fichier pour ajouter des données.")
+                            return
+                        common_idx = restored_df.index.intersection(all_data.index)
+                        restored_df.loc[common_idx, athlete_col] = all_data.loc[common_idx, athlete_col]
+
+                    if save_data_file(restored_df):
                         st.success(f"Données sauvegardées ({len(edited_df)} lignes).")
                         st.rerun()
                     else:
