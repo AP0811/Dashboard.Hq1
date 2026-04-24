@@ -1004,7 +1004,7 @@ def create_activity_calendar(df_filtered, activity_cols):
                                 total = sum(proportions.values())
                                 
                                 # Monotonie en haut à droite
-                                monotony_text = "∞" if monotony == float('inf') else f"{monotony:.1f}"
+                                # monotony_text = "∞" if monotony == float('inf') else f"{monotony:.1f}"
                                 
                                 # Créer la barre stacked avec les couleurs
                                 bars_html = '<div style="display: flex; height: 18px; border-radius: 3px; overflow: hidden; margin: 6px 0; width: 100%;">'
