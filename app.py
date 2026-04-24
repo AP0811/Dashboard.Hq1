@@ -918,7 +918,7 @@ def _parse_activite_status(value):
 
 # Génère le calendrier mensuel avec activités/stats journalières.
 def create_activity_calendar(df_filtered, activity_cols):
-    """Crée un calendrier HTML avec proportions des activités par jour et monotonie"""
+    """Crée un calendrier HTML avec proportions des activités par jour."""
     import calendar as cal_module
     
     color_map = COLOR_PALETTE
@@ -956,13 +956,6 @@ def create_activity_calendar(df_filtered, activity_cols):
                 if status:
                     status_dict[row['Date'].date()] = status
     
-    # Pré-calculer la monotonie cumulée jusqu'à chaque date
-    monotony_dict = {}
-    for i, row in df_filtered_sorted.iterrows():
-        date = row['Date'].date()
-        df_until_date = df_filtered_sorted[df_filtered_sorted['Date'].dt.date <= date]
-        monotony_dict[date] = calculate_monotony(df_until_date)
-    
     # Obtenir les mois à afficher
     if df_filtered.empty:
         return
@@ -997,14 +990,10 @@ def create_activity_calendar(df_filtered, activity_cols):
                         else:
                             date_obj = pd.Timestamp(year=year, month=month, day=day).date()
                             proportions = proportion_dict.get(date_obj, None)
-                            monotony = monotony_dict.get(date_obj, None)
                             
                             if proportions:
                                 # Créer la barre proportionnelle
                                 total = sum(proportions.values())
-                                
-                                # Monotonie en haut à droite
-                                # monotony_text = "∞" if monotony == float('inf') else f"{monotony:.1f}"
                                 
                                 # Créer la barre stacked avec les couleurs
                                 bars_html = '<div style="display: flex; height: 18px; border-radius: 3px; overflow: hidden; margin: 6px 0; width: 100%;">'
@@ -1021,9 +1010,8 @@ def create_activity_calendar(df_filtered, activity_cols):
                                 st.markdown(
                                     f"""
                                     <div style="padding: 8px; border-radius: 5px; background-color: #F9F9F9; min-height: 90px; display: flex; flex-direction: column; position: relative; border: 1px solid #EEE;">
-                                        <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 4px;">
+                                        <div style="display: flex; align-items: flex-start; margin-bottom: 4px;">
                                             <span style="font-weight: bold; font-size: 12px;">{day}</span>
-                                            <span style="font-size: 9px; background-color: rgba(0,0,0,0.1); padding: 2px 4px; border-radius: 3px; font-weight: bold;">{monotony_text}</span>
                                         </div>
                                         {bars_html}
                                         <div style="font-size: 8px; text-align: center; margin-top: 4px; line-height: 1.2;">{activity_names}</div>
