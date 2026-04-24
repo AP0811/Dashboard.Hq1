@@ -817,13 +817,13 @@ def interpret_monotony(monotony_value):
         return "Données insuffisantes", "#FFA500", "⚠️"
     
     if monotony_value < 1.0:
-        return "Variabilité élevée ✅ (bon)", "#28A745", "✓"
+        return "Variabilité élevée (bon)", "#28A745", "✓"
     elif monotony_value < 2.0:
-        return "Normal ✓", "#4ECDC4", "•"
+        return "Normal", "#4ECDC4", "•"
     elif monotony_value < 2.5:
-        return "⚠️ Répétitif", "#FFA500", "!"
+        return "Répétitif", "#FFA500", "!"
     else:
-        return "🔥 Trop répétitif", "#DC3545", "!"
+        return "Trop répétitif", "#DC3545", "!"
 
 
 # Traduit l'AWCR en niveau de risque et code couleur.
@@ -838,7 +838,7 @@ def interpret_awcr(awcr_value):
     elif awcr_value <= 1.5:
         return "Charge élevée", "#FFA500", "!"
     else:
-        return "Risque accru", "#DC3545", "!"
+        return "Charge très élevée", "#DC3545", "!"
 
 
 # Dessine une jauge demi-cercle paramétrable (zones colorées + aiguille).
