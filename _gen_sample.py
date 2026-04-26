@@ -100,7 +100,7 @@ rows += extend_schedule('athlete_001', 14, 38, [
 ])
 
 # Derniers 7 jours volontairement trop stables et trop chargés:
-# monotonie élevée (faible variation quotidienne) + AWCR élevé (grosse hausse aiguë)
+# monotonie élevée (faible variation quotidienne) + ACWR élevé (grosse hausse aiguë)
 rows += [
     row('athlete_001', 38, STATUS_OUI, pratique_dur=110, pratique_int=6, muscu_dur=50, muscu_int=4),
     row('athlete_001', 39, STATUS_OUI, pratique_dur=108, pratique_int=6, muscu_dur=52, muscu_int=4),

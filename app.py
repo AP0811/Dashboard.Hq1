@@ -786,8 +786,8 @@ def calculate_monotony(df):
     return float(valid.iloc[-1])
 
 
-# Calcule l'AWCR: charge aiguë (7j) / (charge chronique (28j) / 4).
-def calculate_awcr(df):
+# Calcule l'ACWR: charge aiguë (7j) / (charge chronique (28j) / 4).
+def calculate_acwr(df):
     if df.empty:
         return float('nan')
 
@@ -826,19 +826,19 @@ def interpret_monotony(monotony_value):
         return "Trop répétitif", "#DC3545", "!"
 
 
-# Traduit l'AWCR en niveau de risque et code couleur.
-def interpret_awcr(awcr_value):
-    if pd.isna(awcr_value) or awcr_value == float('inf'):
+# Traduit l'ACWR en niveau de risque et code couleur.
+def interpret_acwr(acwr_value):
+    if pd.isna(acwr_value) or acwr_value == float('inf'):
         return "Données insuffisantes", "#FFA500", "⚠️"
 
-    if awcr_value < 0.8:
-        return "Charge faible", "#28A745", "↓"
-    elif awcr_value <= 1.3:
-        return "Zone cible", "#4ECDC4", "✓"
-    elif awcr_value <= 1.5:
-        return "Charge élevée", "#FFA500", "!"
+    if acwr_value < 0.5:
+        return "Charge faible (les 7 derniers jours sont faibles par rapport au dernier mois)", "#28A745", "↓"
+    elif acwr_value <= 1.3:
+        return "Zone cible (les 7 derniers jours sont stables par rapport au dernier mois)", "#4ECDC4", "✓"
+    elif acwr_value <= 1.5:
+        return "Charge élevée (les 7 derniers jours sont élevés par rapport au dernier mois)", "#FFA500", "!"
     else:
-        return "Charge très élevée", "#DC3545", "!"
+        return "Charge très élevée (les 7 derniers jours sont très élevés par rapport au dernier mois)", "#DC3545", "!"
 
 
 # Dessine une jauge demi-cercle paramétrable (zones colorées + aiguille).
@@ -1057,7 +1057,8 @@ def create_activity_calendar(df_filtered, activity_cols):
 
 # Affiche le dashboard complet d'un athlète (graphiques, jauges, calendrier).
 def show_athlete_dashboard(athlete_id):
-    st.title(f"Tableau de bord - {name}")
+    st.title("Préparation estivales Maitres chez nous")
+    st.subheader(f"Tableau de bord - {name}")
     df = load_athlete_data(athlete_id)
     if df.empty:
         st.warning("Aucune donnée disponible pour cet athlète.")
@@ -1218,11 +1219,11 @@ def show_athlete_dashboard(athlete_id):
     st.subheader("Monotonie")
     all_monotony_dates = sorted(df['Date'].dt.date.unique().tolist())
     monotony_by_date = {}
-    awcr_by_date = {}
+    acwr_by_date = {}
     for date_value in all_monotony_dates:
         df_until_date = df[df['Date'].dt.date <= date_value]
         monotony_by_date[date_value] = calculate_monotony(df_until_date)
-        awcr_by_date[date_value] = calculate_awcr(df_until_date)
+        acwr_by_date[date_value] = calculate_acwr(df_until_date)
 
     # Sélecteur horizontal de dates (stable, sans reset sur clic)
     def monotony_symbol(value):
@@ -1247,7 +1248,7 @@ def show_athlete_dashboard(athlete_id):
             return '#FFA500'
         return '#DC3545'
 
-    def awcr_zone_color(value):
+    def acwr_zone_color(value):
         if pd.isna(value) or value == float('inf'):
             return '#9E9E9E'
         if value < 0.8:
@@ -1326,8 +1327,8 @@ def show_athlete_dashboard(athlete_id):
 
             for option_index, d in enumerate(month_dates, start=2):
                 mono_color = monotony_zone_color(monotony_by_date.get(d, float('nan')))
-                awcr_color = awcr_zone_color(awcr_by_date.get(d, float('nan')))
-                split_bg = f"linear-gradient(90deg, {mono_color} 0%, {mono_color} 50%, {awcr_color} 50%, {awcr_color} 100%)"
+                acwr_color = acwr_zone_color(acwr_by_date.get(d, float('nan')))
+                split_bg = f"linear-gradient(90deg, {mono_color} 0%, {mono_color} 50%, {acwr_color} 50%, {acwr_color} 100%)"
                 css_rules.append(
                     "div[role='radiogroup'][aria-label='" + radio_label + "'] > label:nth-child(" + str(option_index) + ") {"
                     + f"background:{split_bg}; border:1.5px solid rgba(0,0,0,0.22); border-radius:8px; padding:1px 7px; margin:0; min-height:unset;"
@@ -1339,8 +1340,8 @@ def show_athlete_dashboard(athlete_id):
     monotony_date = st.session_state.selected_monotony_date
     monotony = monotony_by_date.get(monotony_date, float('nan'))
     interpretation, color, emoji = interpret_monotony(monotony)
-    awcr = awcr_by_date.get(monotony_date, float('nan'))
-    awcr_interpretation, awcr_color, awcr_emoji = interpret_awcr(awcr)
+    acwr = acwr_by_date.get(monotony_date, float('nan'))
+    acwr_interpretation, acwr_color, acwr_emoji = interpret_acwr(acwr)
 
     with col_gauge:
         st.markdown("**Monotonie**")
@@ -1372,15 +1373,15 @@ def show_athlete_dashboard(athlete_id):
         )
 
         st.markdown("<div style='height: 18px;'></div>", unsafe_allow_html=True)
-        st.markdown("**AWCR**")
+        st.markdown("**ACWR**")
 
-        if pd.isna(awcr):
-            st.metric(f"AWCR au {monotony_date.isoformat()}", "N/A")
-            st.info("Données insuffisantes pour calculer l'AWCR (minimum 28 jours).")
+        if pd.isna(acwr):
+            st.metric(f"ACWR au {monotony_date.isoformat()}", "N/A")
+            st.info("Données insuffisantes pour calculer l'ACWR (minimum 28 jours).")
         else:
-            awcr_fig = render_semicircle_gauge(
-                f"AWCR au {monotony_date.isoformat()}",
-                awcr,
+            acwr_fig = render_semicircle_gauge(
+                f"ACWR au {monotony_date.isoformat()}",
+                acwr,
                 [
                     (0.0, 0.8, '#28A745'),
                     (0.8, 1.3, '#4ECDC4'),
@@ -1390,11 +1391,11 @@ def show_athlete_dashboard(athlete_id):
                 2.0,
                 [0.0, 0.8, 1.3, 1.5, 2.0],
             )
-            st.pyplot(awcr_fig, width='stretch')
-            plt.close(awcr_fig)
+            st.pyplot(acwr_fig, width='stretch')
+            plt.close(acwr_fig)
 
         st.markdown(
-            f"<div style='background-color: {awcr_color}; padding: 10px; border-radius: 8px; color: white; font-weight: 600; text-align: center;'>{awcr_emoji} {awcr_interpretation}</div>",
+            f"<div style='background-color: {acwr_color}; padding: 10px; border-radius: 8px; color: white; font-weight: 600; text-align: center;'>{acwr_emoji} {acwr_interpretation}</div>",
             unsafe_allow_html=True
         )
 
