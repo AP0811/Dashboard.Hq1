@@ -832,9 +832,9 @@ def interpret_acwr(acwr_value):
         return "Données insuffisantes", "#FFA500", "⚠️"
 
     if acwr_value < 0.5:
-        return "Charge faible (les 7 derniers jours sont faibles par rapport au dernier mois)", "#28A745", "↓"
+        return "Charge faible (les 7 derniers jours sont faibles par rapport au dernier mois)", "#4ECDC4", "↓"
     elif acwr_value <= 1.3:
-        return "Zone cible (les 7 derniers jours sont stables par rapport au dernier mois)", "#4ECDC4", "✓"
+        return "Zone cible (les 7 derniers jours sont stables par rapport au dernier mois)", "#28A745", "✓"
     elif acwr_value <= 1.5:
         return "Charge élevée (les 7 derniers jours sont élevés par rapport au dernier mois)", "#FFA500", "!"
     else:
@@ -1251,10 +1251,10 @@ def show_athlete_dashboard(athlete_id):
     def acwr_zone_color(value):
         if pd.isna(value) or value == float('inf'):
             return '#9E9E9E'
-        if value < 0.8:
-            return '#28A745'
-        if value <= 1.3:
+        if value < 0.5:
             return '#4ECDC4'
+        if value <= 1.3:
+            return '#28A745'
         if value <= 1.5:
             return '#FFA500'
         return '#DC3545'
@@ -1383,13 +1383,13 @@ def show_athlete_dashboard(athlete_id):
                 f"ACWR au {monotony_date.isoformat()}",
                 acwr,
                 [
-                    (0.0, 0.8, '#28A745'),
-                    (0.8, 1.3, '#4ECDC4'),
+                    (0.0, 0.5, '#4ECDC4'),
+                    (0.5, 1.3, '#28A745'),
                     (1.3, 1.5, '#FFA500'),
                     (1.5, 2.0, '#DC3545'),
                 ],
                 2.0,
-                [0.0, 0.8, 1.3, 1.5, 2.0],
+                [0.0, 0.5, 1.3, 1.5, 2.0],
             )
             st.pyplot(acwr_fig, width='stretch')
             plt.close(acwr_fig)
