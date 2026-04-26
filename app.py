@@ -756,6 +756,79 @@ def load_athlete_data(athlete_id):
     return df
 
 
+# Retourne la liste des identifiants d'athlètes déclarés dans les comptes.
+def get_registered_athlete_ids():
+    athlete_ids = []
+    for _, info in users.get('usernames', {}).items():
+        role = str(info.get('role', '')).strip().lower()
+        if role == 'athlete':
+            athlete_id = str(info.get('id', '')).strip()
+            if athlete_id and athlete_id.lower() != 'nan':
+                athlete_ids.append(athlete_id)
+    return sorted(set(athlete_ids), key=str.lower)
+
+
+# Construit un suivi de complétude quotidienne des questionnaires sur une période.
+def build_questionnaire_completeness(df_all, athlete_column, start_date, end_date):
+    df_status = df_all.copy()
+    df_status['Date'] = pd.to_datetime(df_status['Date'], format='mixed', errors='coerce')
+    df_status = df_status.dropna(subset=['Date'])
+    df_status[athlete_column] = df_status[athlete_column].astype(str).str.strip()
+
+    period_days = pd.date_range(start=pd.Timestamp(start_date), end=pd.Timestamp(end_date), freq='D').date
+    expected_day_set = set(period_days)
+
+    # Dernière soumission globale par athlète.
+    last_submission = (
+        df_status.groupby(athlete_column, as_index=False)['Date']
+        .max()
+        .rename(columns={'Date': 'Dernière soumission'})
+    )
+
+    registered_ids = set(get_registered_athlete_ids())
+    data_ids = set(df_status[athlete_column].dropna().astype(str).str.strip().tolist())
+    athlete_ids = sorted(registered_ids.union(data_ids), key=str.lower)
+
+    # Jours soumis sur la période (un seul enregistrement par jour suffit).
+    in_period = df_status[
+        (df_status['Date'].dt.date >= start_date) &
+        (df_status['Date'].dt.date <= end_date)
+    ].copy()
+
+    grouped_days = {}
+    if not in_period.empty:
+        grouped_days = (
+            in_period.groupby(athlete_column)['Date']
+            .apply(lambda s: set(pd.to_datetime(s).dt.date.tolist()))
+            .to_dict()
+        )
+
+    rows = []
+    for athlete_id in athlete_ids:
+        submitted_days = grouped_days.get(athlete_id, set())
+        missing_days = sorted(expected_day_set - submitted_days)
+        match = last_submission[last_submission[athlete_column] == athlete_id]
+        last_date = match['Dernière soumission'].iloc[0].date() if not match.empty else None
+
+        expected_count = len(expected_day_set)
+        submitted_count = len(submitted_days)
+        missing_count = len(missing_days)
+        completion_pct = (submitted_count / expected_count * 100.0) if expected_count > 0 else 0.0
+
+        rows.append({
+            'Athlète': athlete_id,
+            'Jours manquants': missing_count,
+            'Complétude (%)': round(completion_pct, 1),
+            'Dernière soumission': last_date,
+            '_missing_days': missing_days,
+        })
+
+    completeness_df = pd.DataFrame(rows)
+    if not completeness_df.empty:
+        completeness_df = completeness_df.sort_values(['Jours manquants', 'Athlète'], ascending=[False, True]).reset_index(drop=True)
+    return completeness_df
+
+
 # Calcule la monotonie: moyenne mobile 7 jours / écart-type mobile 7 jours.
 def calculate_monotony(df):
     if df.empty:
@@ -1412,8 +1485,54 @@ def show_coach_dashboard():
         st.error("Aucune colonne d'identifiant d'athlète trouvée dans le fichier.")
         return
 
+    if 'Date' not in df_all.columns:
+        st.error("Aucune colonne de date trouvée dans le fichier.")
+        return
+
     df_all[athlete_column] = df_all[athlete_column].astype(str).str.strip()
     athletes = sorted(df_all[athlete_column].dropna().unique().tolist())
+
+    st.subheader("Suivi des questionnaires")
+    parsed_dates = pd.to_datetime(df_all['Date'], format='mixed', errors='coerce').dropna()
+    latest_data_date = parsed_dates.max().date() if not parsed_dates.empty else pd.Timestamp.now().date()
+    configured_max_date = load_max_data_date()
+    default_end_date = configured_max_date or latest_data_date
+    fixed_start_date = pd.Timestamp('2026-04-27').date()
+    period_start = fixed_start_date if fixed_start_date <= default_end_date else default_end_date
+    period_end = default_end_date
+
+    min_missing_threshold = 3
+
+    completeness_df = build_questionnaire_completeness(df_all, athlete_column, period_start, period_end)
+    if completeness_df.empty:
+        st.info("Aucun athlète à afficher pour le suivi.")
+    else:
+        fully_complete_count = int((completeness_df['Jours manquants'] == 0).sum())
+        alert_df = completeness_df[completeness_df['Jours manquants'] >= int(min_missing_threshold)].copy()
+        alert_count = len(alert_df)
+        total_count = len(completeness_df)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total athlètes", total_count)
+        c2.metric("A rempli tous les jours", fully_complete_count)
+        c3.metric("Manque >= 3 jours", alert_count)
+
+        st.caption(
+            f"Période analysée: {period_start.isoformat()} à {period_end.isoformat()} "
+            f"({(pd.Timestamp(period_end) - pd.Timestamp(period_start)).days + 1} jours)"
+        )
+
+        if alert_df.empty:
+            st.success(f"Aucun athlète ne manque {int(min_missing_threshold)} jours ou plus sur la période.")
+        else:
+            display_alert_df = alert_df.drop(columns=['_missing_days'])
+            st.dataframe(display_alert_df, width='stretch', hide_index=True)
+
+        with st.expander("Voir le détail complet par athlète"):
+            st.dataframe(completeness_df.drop(columns=['_missing_days']), width='stretch', hide_index=True)
+
+    st.divider()
+
     selected_athlete = st.selectbox("Sélectionner un athlète", athletes)
     if selected_athlete:
         show_athlete_dashboard(selected_athlete)
