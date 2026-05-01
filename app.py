@@ -8,7 +8,9 @@ import hashlib
 import hmac
 import time
 import json
+import re
 import tomllib
+import unicodedata
 from pathlib import Path
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -201,6 +203,29 @@ def find_column(columns, choices):
             if choice.lower() in str(col).strip().lower():
                 return col
     return None
+
+
+# Normalise un identifiant athlète pour un appariement tolérant.
+def normalize_athlete_identifier(value):
+    if pd.isna(value):
+        return ''
+    raw = str(value).strip().lower()
+    if not raw:
+        return ''
+
+    # Supprimer les accents pour aligner "Prénom" et "Prenom".
+    raw = unicodedata.normalize('NFKD', raw)
+    raw = ''.join(ch for ch in raw if not unicodedata.combining(ch))
+
+    # Uniformiser la ponctuation et conserver seulement alphanumérique + espaces.
+    raw = raw.replace(',', ' ')
+    raw = re.sub(r'[^a-z0-9 ]+', ' ', raw)
+    tokens = [token for token in raw.split() if token]
+    if not tokens:
+        return ''
+
+    # Tri des tokens pour reconnaître "Nom, Prénom" et "Prénom Nom" comme équivalents.
+    return ' '.join(sorted(tokens))
 
 
 # Masque un identifiant athlète de manière stable pour l'affichage admin.
@@ -723,12 +748,23 @@ def load_athlete_data(athlete_id):
 
     df = pd.read_excel(file_path)
     athlete_id = str(athlete_id).strip()
+    athlete_id_norm = normalize_athlete_identifier(athlete_id)
     if 'Id' in df.columns:
         df['Id'] = df['Id'].astype(str).str.strip()
-        df = df[df['Id'] == athlete_id].copy()
+        exact_mask = df['Id'] == athlete_id
+        if exact_mask.any():
+            df = df[exact_mask].copy()
+        else:
+            df_norm = df['Id'].apply(normalize_athlete_identifier)
+            df = df[df_norm == athlete_id_norm].copy()
     elif 'athlete_id' in df.columns:
         df['athlete_id'] = df['athlete_id'].astype(str).str.strip()
-        df = df[df['athlete_id'] == athlete_id].copy()
+        exact_mask = df['athlete_id'] == athlete_id
+        if exact_mask.any():
+            df = df[exact_mask].copy()
+        else:
+            df_norm = df['athlete_id'].apply(normalize_athlete_identifier)
+            df = df[df_norm == athlete_id_norm].copy()
     else:
         st.error("Aucune colonne d'identifiant d'athlète trouvée dans le fichier.")
         return pd.DataFrame()
