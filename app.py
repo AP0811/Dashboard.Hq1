@@ -98,16 +98,32 @@ ACTIVITY_LOAD_PAIRS = [
 
 # Configuration des utilisateurs
 # En production, utiliser une base de données sécurisée et une gestion des rôles centralisée
-PRIVATE_DATA_DIR = 'private_data'
+APP_DIR = Path(__file__).resolve().parent
+PRIVATE_DATA_DIR = APP_DIR / 'private_data'
+LEGACY_DATA_DIR = APP_DIR / 'data'
 
 
 # Détermine où lire/écrire les données de l'application.
 def resolve_data_root():
-    # Priorité: variable d'environnement > private_data
+    # Priorité: variable d'environnement > private_data > data (legacy)
     env_data_dir = os.getenv('APP_DATA_DIR')
     if env_data_dir:
-        return env_data_dir
-    return PRIVATE_DATA_DIR
+        env_path = Path(env_data_dir)
+        if not env_path.is_absolute():
+            env_path = APP_DIR / env_path
+        return str(env_path.resolve())
+
+    private_path = PRIVATE_DATA_DIR
+    legacy_path = LEGACY_DATA_DIR
+
+    private_has_data = (private_path / 'Activités.xlsx').exists() or (private_path / 'trainings.xlsx').exists()
+    legacy_has_data = (legacy_path / 'Activités.xlsx').exists() or (legacy_path / 'trainings.xlsx').exists()
+
+    if private_has_data:
+        return str(private_path)
+    if legacy_has_data:
+        return str(legacy_path)
+    return str(private_path)
 
 
 DATA_ROOT = resolve_data_root()
@@ -314,6 +330,71 @@ def format_date_fr(value):
 
 
 # Charge le fichier de comptes (CSV prioritaire, XLSX en fallback).
+def _github_credentials_api_url():
+    """Retourne l'URL de l'API GitHub pour le fichier users.csv, ou None si non configuré."""
+    token = _secret('GITHUB_TOKEN', '')
+    repo  = _secret('GITHUB_REPO', 'AP0811/Dashboard.Hq1')
+    path  = _secret('GITHUB_CREDENTIALS_PATH', 'private_data/credentials/users.csv')
+    if not token or not repo:
+        return None, None, None
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    headers = {
+        'Authorization': f'token {token}',
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'Dashboard-Hq1',
+    }
+    return url, headers, path
+
+
+def _fetch_credentials_from_github():
+    """Télécharge users.csv depuis GitHub et le cache localement. Retourne un DataFrame ou None."""
+    import urllib.request as _ur
+    url, headers, _ = _github_credentials_api_url()
+    if url is None:
+        return None
+    try:
+        req = _ur.Request(url, headers=headers)
+        with _ur.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        csv_bytes = base64.b64decode(data['content'])
+        import io
+        df = pd.read_csv(io.StringIO(csv_bytes.decode('utf-8')))
+        # Cache local pour la session en cours
+        os.makedirs(CREDENTIALS_FOLDER, exist_ok=True)
+        with open(CREDENTIALS_CSV, 'wb') as f:
+            f.write(csv_bytes)
+        return df
+    except Exception:
+        return None
+
+
+def _push_credentials_to_github(csv_content: str) -> bool:
+    """Pousse le fichier users.csv vers GitHub pour persistance entre redémarrages."""
+    import urllib.request as _ur
+    url, headers, _ = _github_credentials_api_url()
+    if url is None:
+        return False
+    # Récupérer le SHA actuel (requis pour le PUT)
+    sha = ''
+    try:
+        req = _ur.Request(url, headers=headers)
+        with _ur.urlopen(req, timeout=10) as resp:
+            sha = json.loads(resp.read()).get('sha', '')
+    except Exception:
+        pass
+    content_b64 = base64.b64encode(csv_content.encode('utf-8')).decode('utf-8')
+    body = {'message': 'Update credentials [skip ci]', 'content': content_b64}
+    if sha:
+        body['sha'] = sha
+    put_headers = {**headers, 'Content-Type': 'application/json'}
+    put_req = _ur.Request(url, data=json.dumps(body).encode('utf-8'), method='PUT', headers=put_headers)
+    try:
+        with _ur.urlopen(put_req, timeout=15) as resp:
+            return resp.status in (200, 201)
+    except Exception:
+        return False
+
+
 def read_credentials_df():
     if os.path.exists(CREDENTIALS_CSV):
         return pd.read_csv(CREDENTIALS_CSV)
@@ -323,6 +404,10 @@ def read_credentials_df():
         except PermissionError:
             st.warning('Le fichier des identifiants est ouvert dans une autre application. Ferme-le pour charger les comptes.')
             return pd.DataFrame()
+    # Fichier absent (ex. reboot Streamlit Cloud) — restaurer depuis GitHub
+    df = _fetch_credentials_from_github()
+    if df is not None:
+        return df
     return None
 
 
@@ -373,14 +458,24 @@ def load_user_credentials():
 users = load_user_credentials()
 
 
-# Écrit les comptes utilisateurs dans le fichier CSV sécurisé.
+# Écrit les comptes utilisateurs dans le fichier CSV sécurisé (écriture atomique + sauvegarde GitHub).
 def write_credentials_df(df):
     os.makedirs(CREDENTIALS_FOLDER, exist_ok=True)
+    tmp_path = CREDENTIALS_CSV + '.tmp'
     try:
-        df.to_csv(CREDENTIALS_CSV, index=False)
-        return True
+        df.to_csv(tmp_path, index=False)
+        os.replace(tmp_path, CREDENTIALS_CSV)
     except PermissionError:
         return False
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return False
+    # Pousser vers GitHub pour survivre aux reboots (silencieux si non configuré)
+    _push_credentials_to_github(df.to_csv(index=False))
+    return True
 
 
 # Sérialise les identifiants en DataFrame puis les sauvegarde.
@@ -702,7 +797,7 @@ with st.sidebar.expander('Créer un compte'):
                 created, msg = append_user_to_file(new_email, new_name or new_email, new_password, 'athlete', athlete_id)
                 if created:
                     st.success('Compte créé. Recharge la page pour te connecter.')
-                    st.experimental_rerun()
+                    st.rerun()
                 elif msg == 'exists':
                     st.warning('Cette adresse courriel existe déjà. Utilise la récupération de mot de passe si nécessaire.')
                 elif msg == 'permission':
@@ -1579,6 +1674,12 @@ def show_admin_dashboard():
     st.title("Administration des données")
     st.markdown("Importez un fichier Qualtrics ou un fichier de données d'entraînement. Seuls les rôles `admin` ou `data_manager` peuvent importer des données.")
     st.caption("Identifiants athlètes masqués dans la vue admin. Réidentification possible via les codes définis dans APP_REID_CODEBOOK / APP_REID_SECRET_KEY (secrets).")
+    st.info(
+        "Stockage actif: "
+        + str(Path(DATA_ROOT).resolve())
+        + "\nSi votre hébergeur met l'application en veille puis relance un nouveau conteneur, "
+        + "les fichiers modifiés localement peuvent être perdus. Configure APP_DATA_DIR vers un stockage persistant."
+    )
     
     # Section Gestion des Utilisateurs
     st.subheader("👥 Gestion des Participants")
