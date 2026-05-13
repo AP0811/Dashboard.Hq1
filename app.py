@@ -432,7 +432,7 @@ def load_user_credentials():
 
         credentials = {'usernames': {}}
         for _, row in df.iterrows():
-            username = str(row[email_col]).strip()
+            username = str(row[email_col]).strip().lower()
             if not username or username.lower() == 'nan':
                 continue
             name = str(row[name_col]).strip() if name_col and not pd.isna(row[name_col]) else username
@@ -589,7 +589,7 @@ def normalize_uploaded_data(df):
 
 # Ajoute un nouvel utilisateur au fichier de comptes.
 def append_user_to_file(email, name, password, role, athlete_id):
-    email = str(email).strip()
+    email = str(email).strip().lower()
     if not email:
         return False, 'invalid'
 
