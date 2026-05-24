@@ -4,3 +4,4 @@ openpyxl
 streamlit-authenticator
 plotly
 matplotlib
+boto3

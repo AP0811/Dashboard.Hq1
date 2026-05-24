@@ -30,6 +30,23 @@ Application Streamlit pour visualiser les charges de travail des athlètes, avec
 - Obtenir le consentement des athlètes pour le traitement des données
 - Implémenter les droits d'accès, rectification et suppression des données
 
+## Persistance Cloudflare R2 (optionnel)
+
+Pour éviter la perte des fichiers lors d'un redémarrage (hébergement avec disque éphémère), l'application peut synchroniser:
+- le fichier d'activités (`Activités.xlsx` ou `trainings.xlsx`)
+- le fichier des comptes (`credentials/users.csv`)
+
+Variables à configurer (secrets ou variables d'environnement):
+- `R2_ENABLED=true`
+- `R2_BUCKET=<nom-du-bucket>`
+- `R2_ACCESS_KEY_ID=<access-key>`
+- `R2_SECRET_ACCESS_KEY=<secret-key>`
+- `R2_ACCOUNT_ID=<account-id>` (ou `R2_ENDPOINT_URL`)
+
+Variables optionnelles:
+- `R2_ACTIVITIES_OBJECT_KEY` (défaut: `private_data/<nom-du-fichier-activites>`)
+- `R2_CREDENTIALS_OBJECT_KEY` (défaut: `private_data/credentials/users.csv`)
+
 ## Format des Données
 
 Fichier Excel `data/Activités.xlsx` avec colonnes principales:

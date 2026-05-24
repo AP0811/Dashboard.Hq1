@@ -137,6 +137,7 @@ def _secret(key, default=''):
     except Exception:
         return os.getenv(key, default)
 
+AUTH_COOKIE_KEY = _secret('APP_AUTH_COOKIE_KEY', AUTH_COOKIE_KEY)
 SMTP_HOST     = _secret('SMTP_HOST', 'smtp.gmail.com')
 SMTP_PORT     = int(_secret('SMTP_PORT', '587'))
 SMTP_USER     = _secret('SMTP_USER', '')
@@ -145,6 +146,14 @@ SMTP_FROM     = _secret('SMTP_FROM', SMTP_USER)
 APP_BASE_URL  = _secret('APP_BASE_URL', 'http://localhost:8501')
 RESET_TOKEN_SECRET = _secret('APP_RESET_TOKEN_SECRET', AUTH_COOKIE_KEY)
 RESET_TOKEN_EXPIRY = 1800  # 30 minutes
+
+# Configuration Cloudflare R2 (compatible API S3)
+R2_ENABLED = _secret('R2_ENABLED', 'false').lower() == 'true'
+R2_ACCOUNT_ID = _secret('R2_ACCOUNT_ID', '')
+R2_BUCKET = _secret('R2_BUCKET', '')
+R2_ACCESS_KEY_ID = _secret('R2_ACCESS_KEY_ID', '')
+R2_SECRET_ACCESS_KEY = _secret('R2_SECRET_ACCESS_KEY', '')
+R2_ENDPOINT_URL = _secret('R2_ENDPOINT_URL', '')
 
 
 def _read_local_streamlit_secrets():
@@ -206,6 +215,76 @@ DEFAULT_USERS = {
 }
 
 file_path = os.path.join(DATA_ROOT, 'Activités.xlsx') if os.path.exists(os.path.join(DATA_ROOT, 'Activités.xlsx')) else os.path.join(DATA_ROOT, 'trainings.xlsx')
+
+# Clés objets R2 (personnalisables)
+R2_ACTIVITIES_OBJECT_KEY = _secret('R2_ACTIVITIES_OBJECT_KEY', f"private_data/{os.path.basename(file_path)}")
+R2_CREDENTIALS_OBJECT_KEY = _secret('R2_CREDENTIALS_OBJECT_KEY', 'private_data/credentials/users.csv')
+
+
+def _r2_is_configured():
+    return all([
+        R2_ENABLED,
+        R2_BUCKET,
+        R2_ACCESS_KEY_ID,
+        R2_SECRET_ACCESS_KEY,
+        R2_ENDPOINT_URL or R2_ACCOUNT_ID,
+    ])
+
+
+def _get_r2_client():
+    if not _r2_is_configured():
+        return None
+    try:
+        import importlib
+        boto3 = importlib.import_module('boto3')
+        endpoint_url = R2_ENDPOINT_URL or f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+        return boto3.client(
+            's3',
+            endpoint_url=endpoint_url,
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            region_name='auto',
+        )
+    except Exception:
+        return None
+
+
+def _r2_download_object_to_path(object_key, local_path):
+    client = _get_r2_client()
+    if client is None:
+        return False
+    try:
+        response = client.get_object(Bucket=R2_BUCKET, Key=object_key)
+        data = response['Body'].read()
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        with open(local_path, 'wb') as f:
+            f.write(data)
+        return True
+    except Exception:
+        return False
+
+
+def _r2_upload_path(object_key, local_path):
+    client = _get_r2_client()
+    if client is None or not os.path.exists(local_path):
+        return False
+    try:
+        client.upload_file(local_path, R2_BUCKET, object_key)
+        return True
+    except Exception:
+        return False
+
+
+def _bootstrap_from_r2():
+    """Restaure les fichiers persistants depuis R2 au démarrage (si configuré)."""
+    if not _r2_is_configured():
+        return
+    # Activités: restaurer uniquement si fichier local absent
+    if not os.path.exists(file_path):
+        _r2_download_object_to_path(R2_ACTIVITIES_OBJECT_KEY, file_path)
+    # Credentials: restaurer uniquement si fichier local absent
+    if not os.path.exists(CREDENTIALS_CSV):
+        _r2_download_object_to_path(R2_CREDENTIALS_OBJECT_KEY, CREDENTIALS_CSV)
 
 
 # Trouve une colonne en essayant plusieurs noms possibles (égalité stricte puis partielle).
@@ -404,6 +483,12 @@ def read_credentials_df():
         except PermissionError:
             st.warning('Le fichier des identifiants est ouvert dans une autre application. Ferme-le pour charger les comptes.')
             return pd.DataFrame()
+    # Fichier absent — restaurer depuis R2
+    if _r2_download_object_to_path(R2_CREDENTIALS_OBJECT_KEY, CREDENTIALS_CSV):
+        try:
+            return pd.read_csv(CREDENTIALS_CSV)
+        except Exception:
+            pass
     # Fichier absent (ex. reboot Streamlit Cloud) — restaurer depuis GitHub
     df = _fetch_credentials_from_github()
     if df is not None:
@@ -455,6 +540,7 @@ def load_user_credentials():
     return {'usernames': DEFAULT_USERS}
 
 
+_bootstrap_from_r2()
 users = load_user_credentials()
 
 
@@ -473,6 +559,8 @@ def write_credentials_df(df):
         except OSError:
             pass
         return False
+    # Pousser vers R2 pour survivre aux redémarrages
+    _r2_upload_path(R2_CREDENTIALS_OBJECT_KEY, CREDENTIALS_CSV)
     # Pousser vers GitHub pour survivre aux reboots (silencieux si non configuré)
     _push_credentials_to_github(df.to_csv(index=False))
     return True
@@ -501,6 +589,7 @@ def save_data_file(df):
             df.to_excel(file_path, index=False)
         else:
             df.to_csv(file_path, index=False)
+        _r2_upload_path(R2_ACTIVITIES_OBJECT_KEY, file_path)
         return True
     except PermissionError:
         return False
@@ -837,6 +926,8 @@ with st.sidebar.expander('Mot de passe oublié'):
                         st.success('Si ce courriel est associé à un compte, un lien de réinitialisation a été envoyé (valide 30 minutes).')
 # Charge et prépare les données d'un athlète pour le dashboard.
 def load_athlete_data(athlete_id):
+    if not os.path.exists(file_path):
+        _r2_download_object_to_path(R2_ACTIVITIES_OBJECT_KEY, file_path)
     if not os.path.exists(file_path):
         st.error("Fichier de données non trouvé.")
         return pd.DataFrame()
