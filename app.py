@@ -871,28 +871,127 @@ def send_reset_email(to_email, token):
         return False, str(exc)
 
 
+# Retourne les identifiants athlètes présents dans le fichier de données principal.
+def get_data_athlete_ids():
+    if not os.path.exists(file_path):
+        _r2_download_object_to_path(R2_ACTIVITIES_OBJECT_KEY, file_path)
+    if not os.path.exists(file_path):
+        return []
+
+    try:
+        if file_path.lower().endswith('.xlsx'):
+            df = pd.read_excel(file_path)
+        else:
+            df = pd.read_csv(file_path)
+    except Exception:
+        return []
+
+    athlete_col = find_column(df.columns, ['Id', 'athlete_id', 'utilisateur', 'Utilisateur'])
+    if athlete_col is None:
+        return []
+
+    athlete_ids = (
+        df[athlete_col]
+        .dropna()
+        .astype(str)
+        .str.strip()
+    )
+    athlete_ids = [value for value in athlete_ids.tolist() if value and value.lower() != 'nan']
+    return sorted(set(athlete_ids), key=str.lower)
+
+
+# Tente de corriger automatiquement un identifiant athlète mal associé au compte.
+def resolve_account_athlete_id(username, user_info):
+    current_id = str(user_info.get('id', '')).strip()
+    athlete_name = str(user_info.get('name', '')).strip()
+    username_norm = normalize_athlete_identifier(username)
+    name_norm = normalize_athlete_identifier(athlete_name)
+
+    data_ids = get_data_athlete_ids()
+    if not data_ids:
+        return current_id, False
+
+    # Conserver l'identifiant actuel s'il existe déjà dans les données.
+    current_norm = normalize_athlete_identifier(current_id)
+    if current_norm and any(normalize_athlete_identifier(candidate) == current_norm for candidate in data_ids):
+        return current_id, False
+
+    username_matches = [
+        candidate for candidate in data_ids
+        if username_norm and normalize_athlete_identifier(candidate) == username_norm
+    ]
+    name_matches = [
+        candidate for candidate in data_ids
+        if name_norm and normalize_athlete_identifier(candidate) == name_norm
+    ]
+
+    selected = None
+    if len(username_matches) == 1:
+        selected = username_matches[0]
+    elif len(name_matches) == 1:
+        selected = name_matches[0]
+
+    if not selected:
+        return current_id, False
+
+    users['usernames'][username]['id'] = selected
+    save_user_credentials(users)
+    return selected, True
+
+
 with st.sidebar.expander('Créer un compte'):
     with st.form('register_form', clear_on_submit=True):
+        existing_athlete_ids = get_data_athlete_ids()
         new_email = st.text_input('Adresse courriel')
         new_name = st.text_input('Nom complet')
         new_password = st.text_input('Mot de passe', type='password')
-        athlete_id = st.text_input('Identifiant athlète (facultatif)')
+        selected_athlete_id = st.selectbox(
+            "Associer à l'identifiant athlète existant",
+            options=[''] + existing_athlete_ids,
+            format_func=lambda value: 'Sélectionner...' if value == '' else value
+        )
+        manual_athlete_id = st.text_input("Identifiant athlète (si absent de la liste)")
         if st.form_submit_button('Créer un compte'):
             if not new_email or not new_password:
                 st.error('Adresse courriel et mot de passe sont requis.')
             else:
-                if not athlete_id:
-                    athlete_id = new_email
-                created, msg = append_user_to_file(new_email, new_name or new_email, new_password, 'athlete', athlete_id)
-                if created:
-                    st.success('Compte créé. Recharge la page pour te connecter.')
-                    st.rerun()
-                elif msg == 'exists':
-                    st.warning('Cette adresse courriel existe déjà. Utilise la récupération de mot de passe si nécessaire.')
-                elif msg == 'permission':
-                    st.error('Impossible d’écrire le fichier des identifiants. Ferme le fichier Excel ou vérifie les permissions.')
+                resolved_athlete_id = str(selected_athlete_id).strip() if selected_athlete_id else ''
+                if not resolved_athlete_id:
+                    resolved_athlete_id = str(manual_athlete_id).strip()
+
+                if not resolved_athlete_id and new_name and existing_athlete_ids:
+                    normalized_name = normalize_athlete_identifier(new_name)
+                    matches = [
+                        candidate
+                        for candidate in existing_athlete_ids
+                        if normalize_athlete_identifier(candidate) == normalized_name
+                    ]
+                    if len(matches) == 1:
+                        resolved_athlete_id = matches[0]
+
+                if not resolved_athlete_id and existing_athlete_ids:
+                    st.error("Sélectionne ton identifiant athlète existant (ou saisis-le) pour éviter la création d'un nouveau profil.")
                 else:
-                    st.error('Impossible de créer le compte. Vérifie les informations et réessaie.')
+                    if not resolved_athlete_id:
+                        resolved_athlete_id = str(new_email).strip().lower()
+                        st.info("Aucun identifiant athlète existant détecté: le courriel sera utilisé comme identifiant.")
+
+                    created, msg = append_user_to_file(
+                        new_email,
+                        new_name or new_email,
+                        new_password,
+                        'athlete',
+                        resolved_athlete_id
+                    )
+                    if created:
+                        st.success(f"Compte créé et associé à l'identifiant: {resolved_athlete_id}. Recharge la page pour te connecter.")
+                        st.rerun()
+                    elif msg == 'exists':
+                        st.warning('Cette adresse courriel existe déjà. Utilise la récupération de mot de passe si nécessaire.')
+                    elif msg == 'permission':
+                        st.error('Impossible d’écrire le fichier des identifiants. Ferme le fichier Excel ou vérifie les permissions.')
+                    else:
+                        st.error('Impossible de créer le compte. Vérifie les informations et réessaie.')
 
 with st.sidebar.expander('Mot de passe oublié'):
     if not SMTP_USER or not SMTP_PASSWORD:
@@ -1961,7 +2060,7 @@ try:
         'main',
         fields={
             'Form name': 'Connexion',
-            'Username': "Nom d'utilisateur",
+            'Username': 'Adresse courriel',
             'Password': 'Mot de passe',
             'Login': 'Se connecter'
         }
@@ -1989,7 +2088,9 @@ if authentication_status:
     st.write(f'Bienvenue *{name}*')
     user_role = users['usernames'][username]['role']
     if user_role == 'athlete':
-        athlete_id = users['usernames'][username]['id']
+        athlete_id, was_relinked = resolve_account_athlete_id(username, users['usernames'][username])
+        if was_relinked:
+            st.info(f"Ton compte a été relié automatiquement à l'identifiant athlète: {athlete_id}")
         show_athlete_dashboard(athlete_id)
     elif user_role == 'coach':
         show_coach_dashboard()
