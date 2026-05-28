@@ -276,15 +276,12 @@ def _r2_upload_path(object_key, local_path):
 
 
 def _bootstrap_from_r2():
-    """Restaure les fichiers persistants depuis R2 au démarrage (si configuré)."""
+    """Synchronise les fichiers persistants depuis R2 au démarrage (si configuré)."""
     if not _r2_is_configured():
         return
-    # Activités: restaurer uniquement si fichier local absent
-    if not os.path.exists(file_path):
-        _r2_download_object_to_path(R2_ACTIVITIES_OBJECT_KEY, file_path)
-    # Credentials: restaurer uniquement si fichier local absent
-    if not os.path.exists(CREDENTIALS_CSV):
-        _r2_download_object_to_path(R2_CREDENTIALS_OBJECT_KEY, CREDENTIALS_CSV)
+    # Toujours tenter une synchro au démarrage pour refléter les dernières données partagées.
+    _r2_download_object_to_path(R2_ACTIVITIES_OBJECT_KEY, file_path)
+    _r2_download_object_to_path(R2_CREDENTIALS_OBJECT_KEY, CREDENTIALS_CSV)
 
 
 # Trouve une colonne en essayant plusieurs noms possibles (égalité stricte puis partielle).
