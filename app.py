@@ -11,6 +11,7 @@ import json
 import re
 import tomllib
 import unicodedata
+from difflib import SequenceMatcher
 from pathlib import Path
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -318,6 +319,50 @@ def normalize_athlete_identifier(value):
 
     # Tri des tokens pour reconnaître "Nom, Prénom" et "Prénom Nom" comme équivalents.
     return ' '.join(sorted(tokens))
+
+
+# Trouve le meilleur identifiant athlète à partir d'un nom, avec tolérance aux petites variantes.
+def find_best_athlete_id_by_name(raw_name, candidate_ids):
+    target_norm = normalize_athlete_identifier(raw_name)
+    if not target_norm or not candidate_ids:
+        return None
+
+    exact_matches = [
+        candidate
+        for candidate in candidate_ids
+        if normalize_athlete_identifier(candidate) == target_norm
+    ]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+
+    target_tokens = set(target_norm.split())
+    scored_matches = []
+    for candidate in candidate_ids:
+        candidate_norm = normalize_athlete_identifier(candidate)
+        if not candidate_norm:
+            continue
+        candidate_tokens = set(candidate_norm.split())
+        if target_tokens and not (target_tokens & candidate_tokens):
+            continue
+
+        similarity = SequenceMatcher(None, target_norm, candidate_norm).ratio()
+        token_overlap = len(target_tokens & candidate_tokens) / max(len(target_tokens), 1)
+        score = similarity + (0.15 * token_overlap)
+        scored_matches.append((score, similarity, candidate))
+
+    if not scored_matches:
+        return None
+
+    scored_matches.sort(key=lambda item: item[0], reverse=True)
+    best_score, best_similarity, best_candidate = scored_matches[0]
+    second_score = scored_matches[1][0] if len(scored_matches) > 1 else 0.0
+
+    # Seuils prudents pour éviter de lier au mauvais athlète.
+    if best_similarity < 0.84:
+        return None
+    if (best_score - second_score) < 0.05:
+        return None
+    return best_candidate
 
 
 # Masque un identifiant athlète de manière stable pour l'affichage admin.
@@ -898,7 +943,7 @@ def get_data_athlete_ids():
 
 
 # Tente de corriger automatiquement un identifiant athlète mal associé au compte.
-def resolve_account_athlete_id(username, user_info):
+def resolve_account_athlete_id(username, user_info, persist=True):
     current_id = str(user_info.get('id', '')).strip()
     athlete_name = str(user_info.get('name', '')).strip()
     username_norm = normalize_athlete_identifier(username)
@@ -929,11 +974,91 @@ def resolve_account_athlete_id(username, user_info):
         selected = name_matches[0]
 
     if not selected:
+        selected = find_best_athlete_id_by_name(athlete_name, data_ids)
+
+    if not selected:
         return current_id, False
 
     users['usernames'][username]['id'] = selected
-    save_user_credentials(users)
+    if persist:
+        save_user_credentials(users)
     return selected, True
+
+
+# Corrige en lot les comptes athlètes déjà existants pour éviter les doublons (courriel vs nom réel).
+def reconcile_all_athlete_account_ids():
+    updated_count = 0
+    for username, info in users.get('usernames', {}).items():
+        role = str(info.get('role', '')).strip().lower()
+        if role != 'athlete':
+            continue
+        _, was_relinked = resolve_account_athlete_id(username, info, persist=False)
+        if was_relinked:
+            updated_count += 1
+
+    if updated_count > 0:
+        save_user_credentials(users)
+    return updated_count
+
+
+reconcile_all_athlete_account_ids()
+
+
+# Applique un mapping athlete_id basé sur le nom pour les lignes éditées en admin.
+def apply_admin_name_based_mapping(df_users):
+    if df_users is None or df_users.empty:
+        return df_users, 0
+
+    df_mapped = df_users.copy()
+    email_col = find_column(df_mapped.columns, ['email', 'courriel', 'adresse courriel', 'Id'])
+    role_col = find_column(df_mapped.columns, ['role', 'rôle'])
+    name_col = find_column(df_mapped.columns, ['name', 'nom'])
+    athlete_id_col = find_column(df_mapped.columns, ['athlete_id', 'id', 'utilisateur'])
+
+    if role_col is None or name_col is None or athlete_id_col is None:
+        return df_mapped, 0
+
+    if email_col and email_col in df_mapped.columns:
+        df_mapped[email_col] = df_mapped[email_col].astype(str).str.strip().str.lower()
+
+    data_ids = get_data_athlete_ids()
+    if not data_ids:
+        return df_mapped, 0
+
+    mapped_count = 0
+    data_ids_norm = {normalize_athlete_identifier(candidate) for candidate in data_ids}
+
+    for idx, row in df_mapped.iterrows():
+        role_value = str(row.get(role_col, '')).strip().lower()
+        if role_value != 'athlete':
+            continue
+
+        current_name = str(row.get(name_col, '')).strip()
+        current_id = str(row.get(athlete_id_col, '')).strip()
+
+        # Priorité: si le nom correspond de façon fiable à un ID des données, utiliser ce format canonique.
+        matched_id_by_name = find_best_athlete_id_by_name(current_name, data_ids)
+        if matched_id_by_name and matched_id_by_name != current_id:
+            df_mapped.at[idx, athlete_id_col] = matched_id_by_name
+            mapped_count += 1
+            continue
+
+        # Remapper quand l'id est vide, ressemble à un courriel, ou n'existe pas dans les IDs des données.
+        current_norm = normalize_athlete_identifier(current_id)
+        needs_mapping = (
+            not current_id
+            or '@' in current_id
+            or current_norm not in data_ids_norm
+        )
+        if not needs_mapping:
+            continue
+
+        matched_id = find_best_athlete_id_by_name(current_name, data_ids)
+        if matched_id and matched_id != current_id:
+            df_mapped.at[idx, athlete_id_col] = matched_id
+            mapped_count += 1
+
+    return df_mapped, mapped_count
 
 
 with st.sidebar.expander('Créer un compte'):
@@ -957,14 +1082,7 @@ with st.sidebar.expander('Créer un compte'):
                     resolved_athlete_id = str(manual_athlete_id).strip()
 
                 if not resolved_athlete_id and new_name and existing_athlete_ids:
-                    normalized_name = normalize_athlete_identifier(new_name)
-                    matches = [
-                        candidate
-                        for candidate in existing_athlete_ids
-                        if normalize_athlete_identifier(candidate) == normalized_name
-                    ]
-                    if len(matches) == 1:
-                        resolved_athlete_id = matches[0]
+                    resolved_athlete_id = find_best_athlete_id_by_name(new_name, existing_athlete_ids) or ''
 
                 if not resolved_athlete_id and existing_athlete_ids:
                     st.error("Sélectionne ton identifiant athlète existant (ou saisis-le) pour éviter la création d'un nouveau profil.")
@@ -1886,8 +2004,12 @@ def show_admin_dashboard():
         with col_users_save:
             if st.button("💾 Sauvegarder les modifications", key="save_users"):
                 try:
-                    write_credentials_df(edited_users)
-                    st.success(f"Participants sauvegardés ({len(edited_users)} utilisateurs).")
+                    prepared_users, mapped_count = apply_admin_name_based_mapping(edited_users)
+                    write_credentials_df(prepared_users)
+                    if mapped_count > 0:
+                        st.success(f"Participants sauvegardés ({len(prepared_users)} utilisateurs). {mapped_count} identifiant(s) athlète corrigé(s) automatiquement via le nom.")
+                    else:
+                        st.success(f"Participants sauvegardés ({len(prepared_users)} utilisateurs).")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Erreur lors de la sauvegarde : {e}")
