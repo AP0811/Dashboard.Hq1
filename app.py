@@ -516,19 +516,54 @@ def _push_credentials_to_github(csv_content: str) -> bool:
         return False
 
 
+def _file_signature(path):
+    """Retourne une signature stable d'un fichier pour invalider le cache quand il change."""
+    try:
+        stat = os.stat(path)
+        return True, stat.st_mtime_ns, stat.st_size
+    except OSError:
+        return False, 0, 0
+
+
+@st.cache_data(show_spinner=False)
+def _read_dataframe_cached(path, signature):
+    """Lit un CSV/XLSX avec cache Streamlit indexé par signature de fichier."""
+    file_exists, _, _ = signature
+    if not file_exists:
+        return pd.DataFrame()
+    if str(path).lower().endswith('.xlsx'):
+        return pd.read_excel(path)
+    return pd.read_csv(path)
+
+
+def read_main_data_df():
+    """Charge le fichier principal de données avec cache et fallback R2."""
+    if not os.path.exists(file_path):
+        _r2_download_object_to_path(R2_ACTIVITIES_OBJECT_KEY, file_path)
+    if not os.path.exists(file_path):
+        return pd.DataFrame()
+
+    signature = _file_signature(file_path)
+    df = _read_dataframe_cached(file_path, signature)
+    return df.copy()
+
+
 def read_credentials_df():
     if os.path.exists(CREDENTIALS_CSV):
-        return pd.read_csv(CREDENTIALS_CSV)
+        signature = _file_signature(CREDENTIALS_CSV)
+        return _read_dataframe_cached(CREDENTIALS_CSV, signature).copy()
     if os.path.exists(CREDENTIALS_XLSX):
         try:
-            return pd.read_excel(CREDENTIALS_XLSX)
+            signature = _file_signature(CREDENTIALS_XLSX)
+            return _read_dataframe_cached(CREDENTIALS_XLSX, signature).copy()
         except PermissionError:
             st.warning('Le fichier des identifiants est ouvert dans une autre application. Ferme-le pour charger les comptes.')
             return pd.DataFrame()
     # Fichier absent — restaurer depuis R2
     if _r2_download_object_to_path(R2_CREDENTIALS_OBJECT_KEY, CREDENTIALS_CSV):
         try:
-            return pd.read_csv(CREDENTIALS_CSV)
+            signature = _file_signature(CREDENTIALS_CSV)
+            return _read_dataframe_cached(CREDENTIALS_CSV, signature).copy()
         except Exception:
             pass
     # Fichier absent (ex. reboot Streamlit Cloud) — restaurer depuis GitHub
@@ -605,6 +640,7 @@ def write_credentials_df(df):
     _r2_upload_path(R2_CREDENTIALS_OBJECT_KEY, CREDENTIALS_CSV)
     # Pousser vers GitHub pour survivre aux reboots (silencieux si non configuré)
     _push_credentials_to_github(df.to_csv(index=False))
+    _read_dataframe_cached.clear()
     return True
 
 
@@ -632,6 +668,7 @@ def save_data_file(df):
         else:
             df.to_csv(file_path, index=False)
         _r2_upload_path(R2_ACTIVITIES_OBJECT_KEY, file_path)
+        _read_dataframe_cached.clear()
         return True
     except PermissionError:
         return False
@@ -915,17 +952,8 @@ def send_reset_email(to_email, token):
 
 # Retourne les identifiants athlètes présents dans le fichier de données principal.
 def get_data_athlete_ids():
-    if not os.path.exists(file_path):
-        _r2_download_object_to_path(R2_ACTIVITIES_OBJECT_KEY, file_path)
-    if not os.path.exists(file_path):
-        return []
-
-    try:
-        if file_path.lower().endswith('.xlsx'):
-            df = pd.read_excel(file_path)
-        else:
-            df = pd.read_csv(file_path)
-    except Exception:
+    df = read_main_data_df()
+    if df.empty:
         return []
 
     athlete_col = find_column(df.columns, ['Id', 'athlete_id', 'utilisateur', 'Utilisateur'])
@@ -1140,13 +1168,11 @@ with st.sidebar.expander('Mot de passe oublié'):
                         st.success('Si ce courriel est associé à un compte, un lien de réinitialisation a été envoyé (valide 30 minutes).')
 # Charge et prépare les données d'un athlète pour le dashboard.
 def load_athlete_data(athlete_id):
-    if not os.path.exists(file_path):
-        _r2_download_object_to_path(R2_ACTIVITIES_OBJECT_KEY, file_path)
-    if not os.path.exists(file_path):
+    df = read_main_data_df()
+    if df.empty:
         st.error("Fichier de données non trouvé.")
         return pd.DataFrame()
 
-    df = pd.read_excel(file_path)
     athlete_id = str(athlete_id).strip()
     athlete_id_norm = normalize_athlete_identifier(athlete_id)
     if 'Id' in df.columns:
@@ -1911,11 +1937,11 @@ def show_athlete_dashboard(athlete_id):
 # Vue coach: sélection d'un athlète puis affichage de son dashboard.
 def show_coach_dashboard():
     st.title("Tableau de bord coach - Tous les athlètes")
-    if not os.path.exists(file_path):
+    df_all = read_main_data_df()
+    if df_all.empty:
         st.error("Fichier de données non trouvé.")
         return
 
-    df_all = pd.read_excel(file_path)
     athlete_column = 'Id' if 'Id' in df_all.columns else 'athlete_id' if 'athlete_id' in df_all.columns else None
     if athlete_column is None:
         st.error("Aucune colonne d'identifiant d'athlète trouvée dans le fichier.")
@@ -2057,7 +2083,7 @@ def show_admin_dashboard():
         )
 
         if st.button("Ajouter ces données au fichier principal"):
-            existing_df = pd.read_excel(file_path) if os.path.exists(file_path) else pd.DataFrame()
+            existing_df = read_main_data_df() if os.path.exists(file_path) else pd.DataFrame()
 
             # Dédupliquer les données importées (enlever les doublons Id + Date)
             df_deduplicated, duplicates_found = deduplicate_data(df_normalized, existing_df)
@@ -2092,7 +2118,7 @@ def show_admin_dashboard():
     st.subheader("Toutes les données")
     if os.path.exists(file_path):
         try:
-            all_data = pd.read_excel(file_path)
+            all_data = read_main_data_df()
             all_data_admin_view, athlete_col = anonymize_athlete_column_for_admin(all_data)
             
             st.markdown("**Modifier ou supprimer des lignes** : Cochez les cases pour supprimer, éditez les cellules directement, puis cliquez sur **Sauvegarder les modifications**.")
