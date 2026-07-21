@@ -964,6 +964,58 @@ def save_athlete_pdf_document(athlete_id, uploaded_pdf):
     return True, None, index_payload[athlete_id]
 
 
+# Supprime le PDF associé à un athlète (fichier local, index, et objet R2 si configuré).
+def delete_athlete_pdf_document(athlete_id):
+    athlete_id = str(athlete_id).strip()
+    if not athlete_id:
+        return False, 'missing_athlete'
+
+    index_payload = read_athlete_documents_index()
+    if not index_payload:
+        return False, 'not_found'
+
+    target_key = None
+    entry = index_payload.get(athlete_id)
+    if entry is not None:
+        target_key = athlete_id
+    else:
+        requested_norm = normalize_athlete_identifier(athlete_id)
+        for indexed_id, indexed_entry in index_payload.items():
+            if normalize_athlete_identifier(indexed_id) == requested_norm:
+                target_key = indexed_id
+                entry = indexed_entry
+                break
+
+    if target_key is None or not isinstance(entry, Mapping):
+        return False, 'not_found'
+
+    stored_name = str(entry.get('stored_name', '')).strip()
+    removed_entry = index_payload.pop(target_key, None)
+    if removed_entry is None:
+        return False, 'not_found'
+
+    if not write_athlete_documents_index(index_payload):
+        return False, 'write_index_failed'
+
+    if _r2_is_configured() and not _r2_upload_path(R2_ATHLETE_DOCS_INDEX_OBJECT_KEY, ATHLETE_DOCS_INDEX):
+        # Rollback local pour garder la cohérence si la sync index échoue.
+        index_payload[target_key] = entry
+        write_athlete_documents_index(index_payload)
+        return False, 'r2_upload_index_failed'
+
+    if stored_name:
+        local_pdf_path = os.path.join(ATHLETE_DOCS_FOLDER, stored_name)
+        if os.path.exists(local_pdf_path):
+            try:
+                os.remove(local_pdf_path)
+            except OSError:
+                pass
+        if _r2_is_configured():
+            _r2_delete_object(_r2_document_object_key(stored_name))
+
+    return True, None
+
+
 # Trouve le PDF d'un athlète (correspondance exacte puis normalisée).
 def get_athlete_pdf_document(athlete_id):
     athlete_id = str(athlete_id).strip()
@@ -2737,6 +2789,7 @@ def show_coach_dashboard():
                     summary_columns.append('Sommeil (h)')
                 if 'Fatigue score' in summary_table.columns:
                     summary_columns.append('Fatigue score')
+                st.caption("Tableau synthèse par athlète: volumes cumulés, charges récentes (7/28/42 jours), ratios ACWR et répartition par type d'activité.")
                 st.dataframe(summary_table[summary_columns], width='stretch', hide_index=True)
                 export_df = summary_table[summary_columns].rename(columns={'Dernière date': 'Date'}).copy()
 
@@ -2750,12 +2803,14 @@ def show_coach_dashboard():
 
                 with st.expander("Qui est calculé sur la date pivot et qui ne l'est pas"):
                     st.markdown("**Basé sur la date pivot**")
+                    st.caption("Athlètes dont les indicateurs sont calculés sur la date de référence du camp.")
                     if based_on_pivot_df.empty:
                         st.info("Aucun athlète avec calcul basé sur la date pivot.")
                     else:
                         st.dataframe(based_on_pivot_df, width='stretch', hide_index=True)
 
                     st.markdown("**Basé sur une autre date**")
+                    st.caption("Athlètes dont le calcul utilise une autre date, généralement faute de données suffisantes autour de la date pivot.")
                     if not_based_on_pivot_df.empty:
                         st.info("Tous les athlètes sont calculés sur la date pivot.")
                     else:
@@ -2767,6 +2822,7 @@ def show_coach_dashboard():
                 ranking_df = ranking_df[['Rang charge', 'Athlète', 'charge_totale', 'Dernière date']]
 
                 st.markdown("**Classement de la charge totale (du plus élevé au plus faible)**")
+                st.caption("Ce classement compare la charge cumulée totale de chaque athlète sur la période analysée.")
 
                 fig_ranking = px.bar(
                     ranking_df,
@@ -2777,6 +2833,55 @@ def show_coach_dashboard():
                 )
                 fig_ranking.update_layout(showlegend=False)
                 st.plotly_chart(fig_ranking, width='stretch')
+
+                problem_rows = []
+                for _, row in summary_table.iterrows():
+                    athlete = row.get('Athlète')
+                    acwr_28 = row.get('acwr_7_28')
+                    acwr_42 = row.get('acwr_7_42')
+                    charge_7j = row.get('charge_7j')
+                    charge_28j = row.get('charge_28j')
+                    charge_42j = row.get('charge_42j')
+
+                    def add_problem(metric, value, reason, severity):
+                        problem_rows.append({
+                            'Athlète': athlete,
+                            'Métrique': metric,
+                            'Valeur': value,
+                            'Problème': reason,
+                            'Sévérité': severity,
+                        })
+
+                    if pd.isna(charge_7j) or pd.isna(charge_28j) or pd.isna(charge_42j):
+                        add_problem('Fenêtres de charge', 'N/A', 'Historique insuffisant pour 7j/28j/42j', 'Moyenne')
+
+                    if pd.notna(acwr_28):
+                        if acwr_28 > 1.5:
+                            add_problem('ACWR 7/28', f"{acwr_28:.2f}", 'Surcharge élevée', 'Élevée')
+                        elif acwr_28 < 0.5:
+                            add_problem('ACWR 7/28', f"{acwr_28:.2f}", 'Sous-charge marquée', 'Moyenne')
+
+                    if pd.notna(acwr_42):
+                        if acwr_42 > 1.5:
+                            add_problem('ACWR 7/42', f"{acwr_42:.2f}", 'Surcharge élevée', 'Élevée')
+                        elif acwr_42 < 0.5:
+                            add_problem('ACWR 7/42', f"{acwr_42:.2f}", 'Sous-charge marquée', 'Moyenne')
+
+                    for pct_col, label in [('Muscu %', 'Musculation'), ('Cardio %', 'Cardio'), ('Hockey %', 'Hockey'), ('Autres sports %', 'Autres sports')]:
+                        pct_value = row.get(pct_col)
+                        if pd.notna(pct_value) and pct_value >= 85:
+                            add_problem(pct_col, f"{pct_value:.1f}%", f'Charge très concentrée en {label.lower()}', 'Moyenne')
+
+                st.markdown("**Valeurs problématiques**")
+                st.caption("Repérage automatique des situations à surveiller: ACWR élevé/bas, historiques incomplets et répartition de charge trop concentrée.")
+                if problem_rows:
+                    problems_df = pd.DataFrame(problem_rows)
+                    severity_order = {'Élevée': 0, 'Moyenne': 1, 'Faible': 2}
+                    problems_df['_severity_rank'] = problems_df['Sévérité'].map(severity_order).fillna(99)
+                    problems_df = problems_df.sort_values(['_severity_rank', 'Athlète', 'Métrique']).drop(columns=['_severity_rank'])
+                    st.dataframe(problems_df, width='stretch', hide_index=True)
+                else:
+                    st.success("Aucune valeur problématique détectée selon les seuils actuels.")
 
                 # Variabilité en se rapprochant du camp (avant la date pivot).
                 pivot_ts = pd.Timestamp(window_start)
@@ -2854,6 +2959,7 @@ def show_coach_dashboard():
                             'Tendance sommeil',
                             'Variabilité sommeil (J-14 à J-1)',
                         ] if c in variability_df.columns]
+                        st.caption("Ce tableau aide à voir rapidement si le sommeil monte, baisse ou devient plus irrégulier à l'approche du camp.")
                         st.dataframe(variability_df[simple_cols], width='stretch', hide_index=True)
 
                         if 'Delta sommeil (h)' in variability_df.columns:
@@ -2870,55 +2976,8 @@ def show_coach_dashboard():
                                 fig_var.update_layout(showlegend=False)
                                 st.plotly_chart(fig_var, width='stretch')
 
-                problem_rows = []
-                for _, row in summary_table.iterrows():
-                    athlete = row.get('Athlète')
-                    acwr_28 = row.get('acwr_7_28')
-                    acwr_42 = row.get('acwr_7_42')
-                    charge_7j = row.get('charge_7j')
-                    charge_28j = row.get('charge_28j')
-                    charge_42j = row.get('charge_42j')
-
-                    def add_problem(metric, value, reason, severity):
-                        problem_rows.append({
-                            'Athlète': athlete,
-                            'Métrique': metric,
-                            'Valeur': value,
-                            'Problème': reason,
-                            'Sévérité': severity,
-                        })
-
-                    if pd.isna(charge_7j) or pd.isna(charge_28j) or pd.isna(charge_42j):
-                        add_problem('Fenêtres de charge', 'N/A', 'Historique insuffisant pour 7j/28j/42j', 'Moyenne')
-
-                    if pd.notna(acwr_28):
-                        if acwr_28 > 1.5:
-                            add_problem('ACWR 7/28', f"{acwr_28:.2f}", 'Surcharge élevée', 'Élevée')
-                        elif acwr_28 < 0.5:
-                            add_problem('ACWR 7/28', f"{acwr_28:.2f}", 'Sous-charge marquée', 'Moyenne')
-
-                    if pd.notna(acwr_42):
-                        if acwr_42 > 1.5:
-                            add_problem('ACWR 7/42', f"{acwr_42:.2f}", 'Surcharge élevée', 'Élevée')
-                        elif acwr_42 < 0.5:
-                            add_problem('ACWR 7/42', f"{acwr_42:.2f}", 'Sous-charge marquée', 'Moyenne')
-
-                    for pct_col, label in [('Muscu %', 'Musculation'), ('Cardio %', 'Cardio'), ('Hockey %', 'Hockey'), ('Autres sports %', 'Autres sports')]:
-                        pct_value = row.get(pct_col)
-                        if pd.notna(pct_value) and pct_value >= 85:
-                            add_problem(pct_col, f"{pct_value:.1f}%", f'Charge très concentrée en {label.lower()}', 'Moyenne')
-
-                st.markdown("**Valeurs problématiques**")
-                if problem_rows:
-                    problems_df = pd.DataFrame(problem_rows)
-                    severity_order = {'Élevée': 0, 'Moyenne': 1, 'Faible': 2}
-                    problems_df['_severity_rank'] = problems_df['Sévérité'].map(severity_order).fillna(99)
-                    problems_df = problems_df.sort_values(['_severity_rank', 'Athlète', 'Métrique']).drop(columns=['_severity_rank'])
-                    st.dataframe(problems_df, width='stretch', hide_index=True)
-                else:
-                    st.success("Aucune valeur problématique détectée selon les seuils actuels.")
-
                 with st.expander("Voir le détail par date (optionnel)"):
+                    st.caption("Série chronologique complète de la période filtrée, utile pour vérifier un athlète jour par jour.")
                     st.dataframe(analysis_df[display_columns], width='stretch', hide_index=True)
             else:
                 athlete_df = analysis_df.sort_values('Date').copy()
@@ -2975,6 +3034,7 @@ def show_coach_dashboard():
                             st.info("Aucune colonne blessure détectée dans les données.")
 
                     with st.expander("Voir le tableau détaillé"):
+                        st.caption("Historique complet de l'athlète sélectionné sur la période, incluant charge, ACWR et indicateurs de santé disponibles.")
                         st.dataframe(athlete_df[display_columns], width='stretch', hide_index=True)
 
             export_name = f"progression_{analysis_choice.replace(' ', '_').lower()}.csv"
@@ -3082,6 +3142,34 @@ def show_admin_dashboard():
     else:
         st.markdown("**PDF déjà associés**")
         st.dataframe(docs_df, width='stretch', hide_index=True)
+
+        st.markdown("**Supprimer un PDF**")
+        st.caption("Supprime le document associé à un athlète (local et Cloudflare R2 si activé).")
+        available_doc_athletes = docs_df['Athlète'].dropna().astype(str).tolist()
+        delete_col_1, delete_col_2 = st.columns([2, 1])
+        with delete_col_1:
+            delete_athlete_id = st.selectbox(
+                "Athlète à supprimer",
+                available_doc_athletes,
+                key="admin_pdf_delete_athlete_select",
+            )
+        with delete_col_2:
+            confirm_delete = st.checkbox("Confirmer", key="admin_pdf_delete_confirm")
+
+        if st.button("Supprimer le PDF sélectionné", key="admin_pdf_delete_button", type="secondary"):
+            if not confirm_delete:
+                st.warning("Coche 'Confirmer' avant de supprimer.")
+            else:
+                deleted, delete_error = delete_athlete_pdf_document(delete_athlete_id)
+                if deleted:
+                    st.success(f"PDF supprimé pour {delete_athlete_id}.")
+                    st.rerun()
+                elif delete_error == 'not_found':
+                    st.warning("Aucun PDF trouvé pour cet athlète.")
+                elif delete_error == 'r2_upload_index_failed':
+                    st.error("Suppression locale faite, mais la synchronisation de l'index vers Cloudflare R2 a échoué.")
+                else:
+                    st.error("Impossible de supprimer le PDF. Vérifie les permissions et la configuration R2.")
 
     st.divider()
 
