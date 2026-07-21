@@ -229,6 +229,8 @@ file_path = os.path.join(DATA_ROOT, 'Activités.xlsx') if os.path.exists(os.path
 # Clés objets R2 (personnalisables)
 R2_ACTIVITIES_OBJECT_KEY = _secret('R2_ACTIVITIES_OBJECT_KEY', f"private_data/{os.path.basename(file_path)}")
 R2_CREDENTIALS_OBJECT_KEY = _secret('R2_CREDENTIALS_OBJECT_KEY', 'private_data/credentials/users.csv')
+R2_DOCUMENTS_PREFIX = _secret('R2_DOCUMENTS_PREFIX', 'private_data/documents').rstrip('/')
+R2_ATHLETE_DOCS_INDEX_OBJECT_KEY = _secret('R2_ATHLETE_DOCS_INDEX_OBJECT_KEY', f"{R2_DOCUMENTS_PREFIX}/athlete_docs_index.json")
 
 
 def _r2_is_configured():
@@ -285,6 +287,75 @@ def _r2_upload_path(object_key, local_path):
         return False
 
 
+def _r2_delete_object(object_key):
+    client = _get_r2_client()
+    if client is None:
+        return False
+    try:
+        client.delete_object(Bucket=R2_BUCKET, Key=object_key)
+        return True
+    except Exception:
+        return False
+
+
+def _r2_document_object_key(stored_name):
+    safe_name = str(stored_name).strip().lstrip('/')
+    return f"{R2_DOCUMENTS_PREFIX}/{safe_name}"
+
+
+def _r2_restore_documents_from_index():
+    if not _r2_is_configured():
+        return
+    if not _r2_download_object_to_path(R2_ATHLETE_DOCS_INDEX_OBJECT_KEY, ATHLETE_DOCS_INDEX):
+        return
+
+    try:
+        with open(ATHLETE_DOCS_INDEX, 'r', encoding='utf-8') as f:
+            index_payload = json.load(f)
+    except Exception:
+        return
+
+    if not isinstance(index_payload, dict):
+        return
+
+    for entry in index_payload.values():
+        if not isinstance(entry, Mapping):
+            continue
+        stored_name = str(entry.get('stored_name', '')).strip()
+        if not stored_name:
+            continue
+        local_pdf_path = os.path.join(ATHLETE_DOCS_FOLDER, stored_name)
+        if os.path.exists(local_pdf_path):
+            continue
+        _r2_download_object_to_path(_r2_document_object_key(stored_name), local_pdf_path)
+
+
+def _r2_backfill_local_documents_to_r2():
+    if not _r2_is_configured() or not os.path.exists(ATHLETE_DOCS_INDEX):
+        return
+
+    try:
+        with open(ATHLETE_DOCS_INDEX, 'r', encoding='utf-8') as f:
+            index_payload = json.load(f)
+    except Exception:
+        return
+
+    if not isinstance(index_payload, dict):
+        return
+
+    for entry in index_payload.values():
+        if not isinstance(entry, Mapping):
+            continue
+        stored_name = str(entry.get('stored_name', '')).strip()
+        if not stored_name:
+            continue
+        local_pdf_path = os.path.join(ATHLETE_DOCS_FOLDER, stored_name)
+        if os.path.exists(local_pdf_path):
+            _r2_upload_path(_r2_document_object_key(stored_name), local_pdf_path)
+
+    _r2_upload_path(R2_ATHLETE_DOCS_INDEX_OBJECT_KEY, ATHLETE_DOCS_INDEX)
+
+
 def _bootstrap_from_r2():
     """Synchronise les fichiers persistants depuis R2 au démarrage (si configuré)."""
     if not _r2_is_configured():
@@ -292,6 +363,8 @@ def _bootstrap_from_r2():
     # Toujours tenter une synchro au démarrage pour refléter les dernières données partagées.
     _r2_download_object_to_path(R2_ACTIVITIES_OBJECT_KEY, file_path)
     _r2_download_object_to_path(R2_CREDENTIALS_OBJECT_KEY, CREDENTIALS_CSV)
+    _r2_restore_documents_from_index()
+    _r2_backfill_local_documents_to_r2()
 
 
 # Trouve une colonne en essayant plusieurs noms possibles (égalité stricte puis partielle).
@@ -785,6 +858,9 @@ def sanitize_filename_component(value):
 
 # Lit l'index JSON des documents PDF par athlète.
 def read_athlete_documents_index():
+    if not os.path.exists(ATHLETE_DOCS_INDEX) and _r2_is_configured():
+        _r2_download_object_to_path(R2_ATHLETE_DOCS_INDEX_OBJECT_KEY, ATHLETE_DOCS_INDEX)
+
     if not os.path.exists(ATHLETE_DOCS_INDEX):
         return {}
     try:
@@ -839,6 +915,13 @@ def save_athlete_pdf_document(athlete_id, uploaded_pdf):
     with open(stored_path, 'wb') as f:
         f.write(file_bytes)
 
+    if _r2_is_configured() and not _r2_upload_path(_r2_document_object_key(stored_name), stored_path):
+        try:
+            os.remove(stored_path)
+        except OSError:
+            pass
+        return False, 'r2_upload_pdf_failed', None
+
     old_entry = index_payload.get(athlete_id, {})
     old_stored_name = str(old_entry.get('stored_name', '')).strip()
 
@@ -855,6 +938,19 @@ def save_athlete_pdf_document(athlete_id, uploaded_pdf):
             pass
         return False, 'write_index_failed', None
 
+    if _r2_is_configured() and not _r2_upload_path(R2_ATHLETE_DOCS_INDEX_OBJECT_KEY, ATHLETE_DOCS_INDEX):
+        # Revenir à l'index précédent localement pour éviter un état divergent non signalé.
+        if old_entry:
+            index_payload[athlete_id] = old_entry
+        else:
+            index_payload.pop(athlete_id, None)
+        write_athlete_documents_index(index_payload)
+        try:
+            os.remove(stored_path)
+        except OSError:
+            pass
+        return False, 'r2_upload_index_failed', None
+
     if old_stored_name and old_stored_name != stored_name:
         old_path = os.path.join(ATHLETE_DOCS_FOLDER, old_stored_name)
         if os.path.exists(old_path):
@@ -862,6 +958,8 @@ def save_athlete_pdf_document(athlete_id, uploaded_pdf):
                 os.remove(old_path)
             except OSError:
                 pass
+        if _r2_is_configured():
+            _r2_delete_object(_r2_document_object_key(old_stored_name))
 
     return True, None, index_payload[athlete_id]
 
@@ -891,6 +989,8 @@ def get_athlete_pdf_document(athlete_id):
         return None
 
     file_path = os.path.join(ATHLETE_DOCS_FOLDER, stored_name)
+    if not os.path.exists(file_path) and _r2_is_configured():
+        _r2_download_object_to_path(_r2_document_object_key(stored_name), file_path)
     if not os.path.exists(file_path):
         return None
 
@@ -2971,6 +3071,8 @@ def show_admin_dashboard():
                     st.rerun()
                 elif error_code == 'missing_file':
                     st.error("Sélectionne un fichier PDF avant de valider.")
+                elif error_code in ('r2_upload_pdf_failed', 'r2_upload_index_failed'):
+                    st.error("PDF non synchronisé vers Cloudflare R2. Vérifie la configuration R2 et réessaie.")
                 else:
                     st.error("Impossible d'enregistrer le PDF. Vérifie les permissions du dossier de données.")
 

@@ -40,6 +40,8 @@ Application Streamlit pour visualiser les charges de travail des athlètes, avec
 Pour éviter la perte des fichiers lors d'un redémarrage (hébergement avec disque éphémère), l'application peut synchroniser:
 - le fichier d'activités (`Activités.xlsx` ou `trainings.xlsx`)
 - le fichier des comptes (`credentials/users.csv`)
+- les documents PDF des athlètes (`documents/*.pdf`)
+- l'index des documents PDF (`documents/athlete_docs_index.json`)
 
 Variables à configurer (secrets ou variables d'environnement):
 - `R2_ENABLED=true`
@@ -51,6 +53,8 @@ Variables à configurer (secrets ou variables d'environnement):
 Variables optionnelles:
 - `R2_ACTIVITIES_OBJECT_KEY` (défaut: `private_data/<nom-du-fichier-activites>`)
 - `R2_CREDENTIALS_OBJECT_KEY` (défaut: `private_data/credentials/users.csv`)
+- `R2_DOCUMENTS_PREFIX` (défaut: `private_data/documents`)
+- `R2_ATHLETE_DOCS_INDEX_OBJECT_KEY` (défaut: `private_data/documents/athlete_docs_index.json`)
 
 ## Format des Données
 
