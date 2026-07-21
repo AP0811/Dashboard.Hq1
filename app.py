@@ -22,6 +22,11 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Wedge, Circle
 from collections.abc import Mapping
 
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None
+
 # Configuration de la page
 st.set_page_config(layout="wide", page_title="Dashboard Entraînement")
 
@@ -76,6 +81,8 @@ QUALTRICS_Q_TO_VAR = {
     'Q24_1':  'Intensité (skills)',
     'Q25_1':  'Durée (skills)',
     'Q26':    'Skills coach (skills)',
+    'Q29':    'Sommeil (questionnaire)',
+    'Q30':    'Fatigue (questionnaire)',
     'Q33':    'Cardio',
     'Q34_1':  'Intensité (cardio)',
     'Q35_1':  'Durée (cardio)',
@@ -209,6 +216,8 @@ def _load_reid_codebook():
 CREDENTIALS_FOLDER = os.path.join(DATA_ROOT, 'credentials')
 CREDENTIALS_XLSX = os.path.join(CREDENTIALS_FOLDER, 'users.xlsx')
 CREDENTIALS_CSV = os.path.join(CREDENTIALS_FOLDER, 'users.csv')
+ATHLETE_DOCS_FOLDER = os.path.join(DATA_ROOT, 'documents')
+ATHLETE_DOCS_INDEX = os.path.join(ATHLETE_DOCS_FOLDER, 'athlete_docs_index.json')
 
 DEFAULT_USERS = {
     "coach1": {"name": "Coach 1", "password": "coachpass", "role": "coach", "id": "coach1"},
@@ -439,7 +448,16 @@ def parse_qualtrics_df(df):
         + ['Pratique load', 'Muscu load', 'Match load', 'Skills load',
            'Cardio load', 'Sport load', 'Hockey load']
     )
+    wellness_cols = [
+        c for c in df.columns
+        if any(k in str(c).strip().lower() for k in ['sommeil', 'sleep', 'dormi', 'fatigue'])
+    ]
+    keep_cols = keep_cols + wellness_cols
+    # Dédupliquer la liste des colonnes à conserver (en gardant le premier ordre d'apparition).
+    keep_cols = list(dict.fromkeys(keep_cols))
     df = df[[c for c in keep_cols if c in df.columns]]
+    # Sécurité: si des doublons de noms subsistent, garder la première occurrence.
+    df = df.loc[:, ~df.columns.duplicated()]
 
     return df
 
@@ -448,6 +466,61 @@ def parse_qualtrics_df(df):
 def format_date_fr(value):
     dt = pd.to_datetime(value)
     return f"{dt.day:02d} {FRENCH_MONTHS[dt.month]} {dt.year}"
+
+
+# Convertit une réponse sommeil en heures approximatives.
+def parse_sleep_hours(value):
+    if pd.isna(value):
+        return np.nan
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    s = str(value).strip().lower()
+    if not s:
+        return np.nan
+
+    mapping = {
+        'moins de 5': 4.5,
+        'entre 5h et 6h': 5.5,
+        'entre 6h et 7h': 6.5,
+        'entre 7h et 8h': 7.5,
+        'entre 8h et 9h': 8.5,
+        'entre 9h et 10h': 9.5,
+        'plus de 10': 10.5,
+    }
+    for key, hours in mapping.items():
+        if key in s:
+            return hours
+
+    # Fallback: extraire 1 ou 2 nombres et prendre leur moyenne.
+    nums = re.findall(r'\d+(?:[\.,]\d+)?', s)
+    if len(nums) >= 2:
+        a = float(nums[0].replace(',', '.'))
+        b = float(nums[1].replace(',', '.'))
+        return (a + b) / 2.0
+    if len(nums) == 1:
+        return float(nums[0].replace(',', '.'))
+    return np.nan
+
+
+# Convertit une réponse fatigue en score ordinal (1=faible fatigue, 3=fatigue élevée).
+def parse_fatigue_score(value):
+    if pd.isna(value):
+        return np.nan
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    s = str(value).strip().lower()
+    if not s:
+        return np.nan
+
+    if 'repos' in s or 'prête' in s or 'prete' in s:
+        return 1.0
+    if 'peu fatigu' in s or 'un peu' in s:
+        return 2.0
+    if 'plus fatigu' in s:
+        return 3.0
+    return np.nan
 
 
 # Charge le fichier de comptes (CSV prioritaire, XLSX en fallback).
@@ -699,6 +772,228 @@ def save_max_data_date(date_obj):
         return True
     except Exception:
         return False
+
+
+# Retourne une version sûre d'un texte pour un nom de fichier.
+def sanitize_filename_component(value):
+    normalized = normalize_athlete_identifier(value)
+    if not normalized:
+        return 'athlete'
+    safe = re.sub(r'[^a-z0-9]+', '_', normalized).strip('_')
+    return safe or 'athlete'
+
+
+# Lit l'index JSON des documents PDF par athlète.
+def read_athlete_documents_index():
+    if not os.path.exists(ATHLETE_DOCS_INDEX):
+        return {}
+    try:
+        with open(ATHLETE_DOCS_INDEX, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        return {}
+    return {}
+
+
+# Sauvegarde l'index JSON des documents PDF par athlète de manière atomique.
+def write_athlete_documents_index(index_payload):
+    os.makedirs(ATHLETE_DOCS_FOLDER, exist_ok=True)
+    tmp_path = ATHLETE_DOCS_INDEX + '.tmp'
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(index_payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, ATHLETE_DOCS_INDEX)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return False
+
+
+# Enregistre/remplace le PDF associé à un athlète.
+def save_athlete_pdf_document(athlete_id, uploaded_pdf):
+    athlete_id = str(athlete_id).strip()
+    if not athlete_id:
+        return False, 'missing_athlete', None
+    if uploaded_pdf is None:
+        return False, 'missing_file', None
+
+    ext = os.path.splitext(uploaded_pdf.name or '')[1].lower()
+    if ext != '.pdf':
+        ext = '.pdf'
+
+    os.makedirs(ATHLETE_DOCS_FOLDER, exist_ok=True)
+    index_payload = read_athlete_documents_index()
+
+    safe_id = sanitize_filename_component(athlete_id)
+    timestamp = int(time.time())
+    stored_name = f"{safe_id}_{timestamp}{ext}"
+    stored_path = os.path.join(ATHLETE_DOCS_FOLDER, stored_name)
+
+    file_bytes = uploaded_pdf.getbuffer()
+    with open(stored_path, 'wb') as f:
+        f.write(file_bytes)
+
+    old_entry = index_payload.get(athlete_id, {})
+    old_stored_name = str(old_entry.get('stored_name', '')).strip()
+
+    index_payload[athlete_id] = {
+        'original_name': uploaded_pdf.name,
+        'stored_name': stored_name,
+        'uploaded_at': pd.Timestamp.now().isoformat(),
+    }
+
+    if not write_athlete_documents_index(index_payload):
+        try:
+            os.remove(stored_path)
+        except OSError:
+            pass
+        return False, 'write_index_failed', None
+
+    if old_stored_name and old_stored_name != stored_name:
+        old_path = os.path.join(ATHLETE_DOCS_FOLDER, old_stored_name)
+        if os.path.exists(old_path):
+            try:
+                os.remove(old_path)
+            except OSError:
+                pass
+
+    return True, None, index_payload[athlete_id]
+
+
+# Trouve le PDF d'un athlète (correspondance exacte puis normalisée).
+def get_athlete_pdf_document(athlete_id):
+    athlete_id = str(athlete_id).strip()
+    if not athlete_id:
+        return None
+
+    index_payload = read_athlete_documents_index()
+    entry = index_payload.get(athlete_id)
+
+    if entry is None:
+        requested_norm = normalize_athlete_identifier(athlete_id)
+        for indexed_id, indexed_entry in index_payload.items():
+            if normalize_athlete_identifier(indexed_id) == requested_norm:
+                entry = indexed_entry
+                athlete_id = indexed_id
+                break
+
+    if not entry:
+        return None
+
+    stored_name = str(entry.get('stored_name', '')).strip()
+    if not stored_name:
+        return None
+
+    file_path = os.path.join(ATHLETE_DOCS_FOLDER, stored_name)
+    if not os.path.exists(file_path):
+        return None
+
+    original_name = str(entry.get('original_name', stored_name)).strip() or stored_name
+    return {
+        'athlete_id': athlete_id,
+        'file_path': file_path,
+        'stored_name': stored_name,
+        'original_name': original_name,
+        'uploaded_at': entry.get('uploaded_at'),
+    }
+
+
+# Retourne la liste des PDFs disponibles pour l'admin.
+def list_athlete_pdf_documents():
+    index_payload = read_athlete_documents_index()
+    rows = []
+    for athlete_id in sorted(index_payload.keys(), key=str.lower):
+        document = get_athlete_pdf_document(athlete_id)
+        if document is None:
+            continue
+        rows.append({
+            'Athlète': athlete_id,
+            'Fichier': document['original_name'],
+            'Téléversé le': document.get('uploaded_at', ''),
+        })
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(show_spinner=False)
+def render_pdf_preview_pages(pdf_bytes, max_pages=10, zoom=1.25):
+    """Rend les premières pages d'un PDF en PNG pour un aperçu compatible tous navigateurs."""
+    if fitz is None:
+        return [], 0
+
+    pages = []
+    total_pages = 0
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as pdf_doc:
+        total_pages = pdf_doc.page_count
+        render_count = min(total_pages, max_pages)
+        matrix = fitz.Matrix(zoom, zoom)
+
+        for page_index in range(render_count):
+            page = pdf_doc.load_page(page_index)
+            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+            pages.append(pixmap.tobytes("png"))
+
+    return pages, total_pages
+
+
+# Affiche la section de consultation PDF pour un athlète.
+def render_athlete_pdf_section(athlete_id, title, widget_key_prefix):
+    st.subheader(title)
+    document = get_athlete_pdf_document(athlete_id)
+    if document is None:
+        st.info("Aucun document PDF n'est encore associé à cet athlète.")
+        return
+
+    try:
+        with open(document['file_path'], 'rb') as f:
+            pdf_bytes = f.read()
+    except Exception as exc:
+        st.error(f"Impossible de lire le document PDF: {exc}")
+        return
+
+    uploaded_at = document.get('uploaded_at')
+    uploaded_label = ''
+    if uploaded_at:
+        try:
+            uploaded_label = pd.to_datetime(uploaded_at).strftime('%Y-%m-%d %H:%M')
+        except Exception:
+            uploaded_label = str(uploaded_at)
+
+    st.write(f"Document: **{document['original_name']}**")
+    if uploaded_label:
+        st.caption(f"Téléversé le {uploaded_label}")
+
+    st.download_button(
+        "Télécharger le PDF",
+        data=pdf_bytes,
+        file_name=document['original_name'],
+        mime='application/pdf',
+        key=f"{widget_key_prefix}_download_pdf",
+    )
+
+    with st.expander("Aperçu PDF", expanded=True):
+        try:
+            preview_pages, total_pages = render_pdf_preview_pages(pdf_bytes, max_pages=10, zoom=1.2)
+            if not preview_pages:
+                if fitz is None:
+                    st.info("Aperçu indisponible: PyMuPDF n'est pas installé. Utilisez le bouton de téléchargement.")
+                else:
+                    st.info("Aperçu indisponible pour ce fichier. Utilisez le bouton de téléchargement.")
+                return
+
+            for idx, image_bytes in enumerate(preview_pages, start=1):
+                st.image(image_bytes, caption=f"Page {idx}", width='stretch')
+
+            if total_pages > len(preview_pages):
+                st.caption(f"Aperçu limité aux {len(preview_pages)} premières pages sur {total_pages}.")
+        except Exception as exc:
+            st.info("Aperçu indisponible pour ce fichier. Utilisez le bouton de téléchargement.")
+            st.caption(f"Détail technique: {exc}")
 
 
 # Supprime les doublons basés sur la clé composite (Id + Date).
@@ -1345,6 +1640,161 @@ def calculate_acwr(df):
 
     return float(acute_load / chronic_load)
 
+
+# Prépare une table de progression exploitable par les coachs.
+def build_coach_progression_frame(df_all):
+    athlete_column = find_column(df_all.columns, ['Id', 'athlete_id', 'utilisateur', 'Utilisateur'])
+    if athlete_column is None or 'Date' not in df_all.columns:
+        return pd.DataFrame(), athlete_column, {'sleep_column': None, 'fatigue_column': None, 'injury_column': None, 'load_columns': []}
+
+    sleep_column = find_column(df_all.columns, [
+        'Sommeil', 'sleep', 'sommeil', 'hours slept', 'sleep hours',
+        'combien d’heures as-tu dormi', 'combien d\'heures as-tu dormi', 'dormi lors de la nuit passée',
+    ])
+    fatigue_column = find_column(df_all.columns, [
+        'Fatigue', 'fatigue', 'niveau de fatigue',
+        'aujourd\'hui, à quel niveau estimes-tu ton niveau de fatigue',
+        'aujourd\'hui, a quel niveau estimes-tu ton niveau de fatigue',
+    ])
+    injury_column = find_column(df_all.columns, ['Blessure', 'injury', 'injur', 'is injured', 'hurt'])
+
+    all_load_columns = [
+        col for col in df_all.columns
+        if str(col).strip().lower().endswith('load')
+        and str(col).strip().lower() not in {'total load', 'charge_totale'}
+    ]
+
+    hockey_parts = [c for c in ['Pratique load', 'Match load', 'Skills load'] if c in df_all.columns]
+    if hockey_parts:
+        # Si les sous-activités hockey existent, on exclut Hockey load pour éviter le double comptage.
+        load_columns = [col for col in all_load_columns if str(col).strip().lower() != 'hockey load']
+    else:
+        load_columns = all_load_columns
+
+    if not load_columns:
+        total_load_col = find_column(df_all.columns, ['Total load', 'charge_totale'])
+        if total_load_col:
+            load_columns = [total_load_col]
+
+    if not load_columns:
+        return pd.DataFrame(), athlete_column, {
+            'sleep_column': sleep_column,
+            'fatigue_column': fatigue_column,
+            'injury_column': injury_column,
+            'load_columns': load_columns,
+        }
+
+    activity_share_map = {
+        'Muscu load': 'Muscu %',
+        'Cardio load': 'Cardio %',
+        'Sport load': 'Autres sports %',
+    }
+
+    df = df_all.copy()
+    df[athlete_column] = df[athlete_column].astype(str).str.strip()
+    df['Date'] = pd.to_datetime(df['Date'], format='mixed', errors='coerce')
+    df = df.dropna(subset=['Date'])
+    df = df[df[athlete_column].astype(str).str.strip() != '']
+
+    frames = []
+    for athlete_id, athlete_df in df.groupby(athlete_column, sort=False):
+        working = athlete_df.copy()
+        working['_day'] = working['Date'].dt.normalize()
+
+        agg_map = {col: 'sum' for col in load_columns if col in working.columns}
+        if sleep_column and sleep_column in working.columns:
+            working['_sleep_hours'] = working[sleep_column].apply(parse_sleep_hours)
+            agg_map['_sleep_hours'] = 'mean'
+        if fatigue_column and fatigue_column in working.columns:
+            working['_fatigue_score'] = working[fatigue_column].apply(parse_fatigue_score)
+            agg_map['_fatigue_score'] = 'mean'
+        if injury_column and injury_column in working.columns:
+            agg_map[injury_column] = 'max'
+
+        if not agg_map:
+            continue
+
+        daily = working.groupby('_day', as_index=True).agg(agg_map).sort_index()
+        if daily.empty:
+            continue
+
+        full_index = pd.date_range(daily.index.min(), daily.index.max(), freq='D')
+        daily = daily.reindex(full_index)
+        daily.index.name = 'Date'
+
+        for col in load_columns:
+            if col in daily.columns:
+                daily[col] = pd.to_numeric(daily[col], errors='coerce').fillna(0)
+
+        if load_columns:
+            daily['charge_totale'] = daily[load_columns].fillna(0).sum(axis=1)
+        else:
+            daily['charge_totale'] = 0.0
+
+        if '_sleep_hours' in daily.columns:
+            daily = daily.rename(columns={'_sleep_hours': 'Sommeil (h)'})
+            daily['Sommeil (h)'] = pd.to_numeric(daily['Sommeil (h)'], errors='coerce')
+
+        if '_fatigue_score' in daily.columns:
+            daily = daily.rename(columns={'_fatigue_score': 'Fatigue score'})
+            daily['Fatigue score'] = pd.to_numeric(daily['Fatigue score'], errors='coerce')
+
+        if injury_column and injury_column in daily.columns:
+            daily = daily.rename(columns={injury_column: 'Blessure'})
+            daily['Blessure'] = pd.to_numeric(daily['Blessure'], errors='coerce').fillna(0)
+
+        if {'Pratique load', 'Match load', 'Skills load'} & set(daily.columns):
+            parts = [c for c in ['Pratique load', 'Match load', 'Skills load'] if c in daily.columns]
+            daily['Hockey load'] = daily[parts].fillna(0).sum(axis=1)
+        elif 'Hockey load' in daily.columns:
+            daily['Hockey load'] = pd.to_numeric(daily['Hockey load'], errors='coerce').fillna(0)
+        else:
+            daily['Hockey load'] = 0.0
+
+        for source_col, target_col in activity_share_map.items():
+            if source_col in daily.columns:
+                daily[target_col] = np.where(
+                    daily['charge_totale'] > 0,
+                    (pd.to_numeric(daily[source_col], errors='coerce').fillna(0) / daily['charge_totale']) * 100.0,
+                    0.0,
+                )
+            else:
+                daily[target_col] = 0.0
+
+        daily['Hockey %'] = np.where(
+            daily['charge_totale'] > 0,
+            (pd.to_numeric(daily['Hockey load'], errors='coerce').fillna(0) / daily['charge_totale']) * 100.0,
+            0.0,
+        )
+
+        daily['Athlète'] = athlete_id
+        daily['charge_7j'] = daily['charge_totale'].rolling(window=7, min_periods=7).sum()
+        daily['charge_28j'] = daily['charge_totale'].rolling(window=28, min_periods=28).sum()
+        daily['charge_42j'] = daily['charge_totale'].rolling(window=42, min_periods=42).sum()
+        daily['acwr_7_28'] = daily['charge_7j'] / (daily['charge_28j'] / 4.0)
+        daily['acwr_7_42'] = daily['charge_7j'] / (daily['charge_42j'] / 6.0)
+        daily['variation_7j'] = daily['charge_7j'] - daily['charge_7j'].shift(7)
+        daily = daily.reset_index()
+
+        frames.append(daily)
+
+    if not frames:
+        return pd.DataFrame(), athlete_column, {
+            'sleep_column': sleep_column,
+            'fatigue_column': fatigue_column,
+            'injury_column': injury_column,
+            'load_columns': load_columns,
+        }
+
+    result = pd.concat(frames, ignore_index=True)
+    result = result.sort_values(['Athlète', 'Date']).reset_index(drop=True)
+    return result, athlete_column, {
+        'sleep_column': sleep_column,
+        'fatigue_column': fatigue_column,
+        'injury_column': injury_column,
+        'load_columns': load_columns,
+    }
+
 # Traduit la monotonie en message clinique simple et code couleur.
 def interpret_monotony(monotony_value):
     """Interprète la valeur de monotonie et retourne (texte, couleur, emoji)"""
@@ -1591,9 +2041,18 @@ def create_activity_calendar(df_filtered, activity_cols):
 
 
 # Affiche le dashboard complet d'un athlète (graphiques, jauges, calendrier).
-def show_athlete_dashboard(athlete_id):
+def show_athlete_dashboard(athlete_id, show_pdf_section=True):
     st.title("Préparation estivales Maitres chez nous")
     st.subheader(f"Tableau de bord - {name}")
+
+    if show_pdf_section:
+        render_athlete_pdf_section(
+            athlete_id,
+            "Document PDF personnel",
+            f"athlete_{sanitize_filename_component(athlete_id)}",
+        )
+        st.divider()
+
     df = load_athlete_data(athlete_id)
     if df.empty:
         st.warning("Aucune donnée disponible pour cet athlète.")
@@ -1995,9 +2454,447 @@ def show_coach_dashboard():
 
     st.divider()
 
+    st.subheader("Analyse simple et export")
+    progression_df, progression_athlete_column, progression_meta = build_coach_progression_frame(df_all)
+    if progression_df.empty:
+        st.info("Pas assez de données pour calculer une table de progression. Le suivi détaillé reste disponible dans le dashboard athlète.")
+    else:
+        if not pd.isna(progression_df['Date']).all():
+            latest_progress_date = progression_df['Date'].max().date()
+        else:
+            latest_progress_date = pd.Timestamp.now().date()
+
+        default_anchor = pd.Timestamp('2026-07-06').date()
+        if default_anchor > latest_progress_date:
+            default_anchor = latest_progress_date
+
+        default_end = min(default_anchor + pd.Timedelta(days=6), pd.Timestamp(latest_progress_date).to_pydatetime().date())
+        window_start = st.date_input("Date pivot des tests", value=default_anchor)
+        window_end = st.date_input("Fin de fenêtre d'analyse", value=default_end)
+
+        analysis_options = ['Tous les athlètes'] + athletes
+        analysis_choice = st.selectbox("Vue d'analyse", analysis_options, key="coach_analysis_scope")
+        if analysis_choice == 'Tous les athlètes':
+            analysis_df = progression_df.copy()
+        else:
+            analysis_df = progression_df[progression_df['Athlète'] == analysis_choice].copy()
+
+        analysis_df = analysis_df[
+            (analysis_df['Date'].dt.date >= window_start) &
+            (analysis_df['Date'].dt.date <= window_end)
+        ].copy()
+
+        analysis_df = analysis_df.sort_values(['Athlète', 'Date']).reset_index(drop=True)
+
+        # Pour les métriques 7j/28j/42j/ACWR: prendre la dernière date saisie par athlète
+        # (jusqu'à la fin de fenêtre), même s'il n'y a rien le jour pivot.
+        metrics_source_df = progression_df[
+            progression_df['Date'].dt.date <= window_end
+        ].copy()
+        metrics_source_df = metrics_source_df.sort_values(['Athlète', 'Date']).reset_index(drop=True)
+
+        latest_rows = pd.DataFrame()
+        if not metrics_source_df.empty:
+            selected_rows = []
+            for athlete_id, athlete_df in metrics_source_df.groupby('Athlète', sort=False):
+                athlete_df = athlete_df.sort_values('Date')
+                last_date = athlete_df['Date'].max().date()
+
+                if last_date > window_start:
+                    # Règle demandée: si dernière date après le 6 juillet, utiliser le 6 juillet
+                    # (ou la plus proche date antérieure si aucune saisie ce jour-là).
+                    eligible = athlete_df[athlete_df['Date'].dt.date <= window_start]
+                    chosen = eligible.tail(1) if not eligible.empty else athlete_df.tail(1)
+                else:
+                    chosen = athlete_df.tail(1)
+
+                selected_rows.append(chosen)
+
+            if selected_rows:
+                latest_rows = pd.concat(selected_rows, ignore_index=True)
+
+        # Fallback: si un athlète n'a aucune saisie avant la fin de fenêtre,
+        # utiliser sa dernière saisie connue pour éviter les None inutiles.
+        fallback_latest = progression_df.sort_values(['Athlète', 'Date']).groupby('Athlète', as_index=False).tail(1)
+        if latest_rows.empty:
+            latest_rows = fallback_latest.copy()
+        else:
+            missing_athletes = set(fallback_latest['Athlète']) - set(latest_rows['Athlète'])
+            if missing_athletes:
+                latest_rows = pd.concat(
+                    [latest_rows, fallback_latest[fallback_latest['Athlète'].isin(missing_athletes)]],
+                    ignore_index=True,
+                )
+
+        if analysis_df.empty:
+            st.warning("Aucune donnée disponible pour cette vue.")
+        else:
+            metric_cols = st.columns(4)
+            with metric_cols[0]:
+                st.metric("Athlètes suivis", int(analysis_df['Athlète'].nunique()))
+            with metric_cols[1]:
+                st.metric("Dernière date", format_date_fr(analysis_df['Date'].max()))
+            with metric_cols[2]:
+                mean_acwr_28 = latest_rows['acwr_7_28'].dropna().mean()
+                st.metric("ACWR 7/28 moyen", "N/A" if pd.isna(mean_acwr_28) else f"{mean_acwr_28:.2f}")
+            with metric_cols[3]:
+                mean_acwr_42 = latest_rows['acwr_7_42'].dropna().mean()
+                st.metric("ACWR 7/42 moyen", "N/A" if pd.isna(mean_acwr_42) else f"{mean_acwr_42:.2f}")
+
+            extra_metrics = []
+            if progression_meta.get('sleep_column') and 'Sommeil (h)' in analysis_df.columns:
+                sleep_mean = analysis_df['Sommeil (h)'].dropna().mean()
+                extra_metrics.append(("Sommeil moyen", "N/A" if pd.isna(sleep_mean) else f"{sleep_mean:.1f} h"))
+            if progression_meta.get('fatigue_column') and 'Fatigue score' in analysis_df.columns:
+                fatigue_mean = analysis_df['Fatigue score'].dropna().mean()
+                extra_metrics.append(("Fatigue moyenne", "N/A" if pd.isna(fatigue_mean) else f"{fatigue_mean:.2f}/3"))
+            if progression_meta.get('injury_column') and 'Blessure' in analysis_df.columns:
+                injury_days = int((analysis_df['Blessure'].fillna(0) > 0).sum())
+                extra_metrics.append(("Jours blessure", str(injury_days)))
+
+            if extra_metrics:
+                extra_cols = st.columns(len(extra_metrics))
+                for col, (label, value) in zip(extra_cols, extra_metrics):
+                    with col:
+                        st.metric(label, value)
+
+            st.caption(
+                f"Fenêtre analysée: {window_start.isoformat()} à {window_end.isoformat()} "
+                "avec un pivot centré sur la date des tests physiques."
+            )
+            st.caption("Cette table est prête à être exportée puis fusionnée avec vos autres données pour suivre les progressions.")
+
+            display_columns = [
+                'Athlète', 'Date', 'charge_totale', 'charge_7j', 'charge_28j', 'charge_42j',
+                'acwr_7_28', 'acwr_7_42', 'Muscu %', 'Cardio %', 'Hockey %', 'Autres sports %'
+            ]
+            export_df = pd.DataFrame()
+            if 'Sommeil (h)' in analysis_df.columns:
+                display_columns.append('Sommeil (h)')
+            if 'Fatigue score' in analysis_df.columns:
+                display_columns.append('Fatigue score')
+            if 'Blessure' in analysis_df.columns:
+                display_columns.append('Blessure')
+
+            if analysis_choice == 'Tous les athlètes':
+                # charge_totale du tableau = cumul de toutes les journées d'entraînement disponibles.
+                cumulative_df = progression_df.copy()
+                agg_map = {'charge_totale': 'sum'}
+                for col in ['Muscu load', 'Cardio load', 'Hockey load', 'Sport load']:
+                    if col in cumulative_df.columns:
+                        agg_map[col] = 'sum'
+
+                aggregated = cumulative_df.groupby('Athlète', as_index=False).agg(agg_map)
+                sessions_total = (
+                    cumulative_df.assign(_session=(pd.to_numeric(cumulative_df['charge_totale'], errors='coerce').fillna(0) > 0).astype(int))
+                    .groupby('Athlète', as_index=False)['_session']
+                    .sum()
+                    .rename(columns={'_session': 'Séances entraînement (total)'})
+                )
+                aggregated = aggregated.merge(sessions_total, on='Athlète', how='left')
+
+                for col in ['Muscu load', 'Cardio load', 'Hockey load', 'Sport load']:
+                    if col not in aggregated.columns:
+                        aggregated[col] = 0.0
+
+                aggregated['Muscu %'] = np.where(
+                    aggregated['charge_totale'] > 0,
+                    (aggregated['Muscu load'] / aggregated['charge_totale']) * 100.0,
+                    0.0,
+                )
+                aggregated['Cardio %'] = np.where(
+                    aggregated['charge_totale'] > 0,
+                    (aggregated['Cardio load'] / aggregated['charge_totale']) * 100.0,
+                    0.0,
+                )
+                aggregated['Hockey %'] = np.where(
+                    aggregated['charge_totale'] > 0,
+                    (aggregated['Hockey load'] / aggregated['charge_totale']) * 100.0,
+                    0.0,
+                )
+                aggregated['Autres sports %'] = np.where(
+                    aggregated['charge_totale'] > 0,
+                    (aggregated['Sport load'] / aggregated['charge_totale']) * 100.0,
+                    0.0,
+                )
+
+                latest_metrics = latest_rows[['Athlète', 'Date', 'charge_7j', 'charge_28j', 'charge_42j', 'acwr_7_28', 'acwr_7_42']].copy()
+                latest_metrics = latest_metrics.rename(columns={'Date': 'Dernière date'})
+                latest_metrics['Dernière date'] = pd.to_datetime(latest_metrics['Dernière date'], errors='coerce').dt.date
+                if 'Sommeil (h)' in latest_rows.columns:
+                    latest_metrics['Sommeil (h)'] = latest_rows['Sommeil (h)'].values
+                if 'Fatigue score' in latest_rows.columns:
+                    latest_metrics['Fatigue score'] = latest_rows['Fatigue score'].values
+                summary_table = aggregated.merge(latest_metrics, on='Athlète', how='left')
+                summary_table['Basé sur date pivot'] = summary_table['Dernière date'] == window_start
+                summary_table['Référence calcul'] = np.where(summary_table['Basé sur date pivot'], 'Date pivot', 'Autre date')
+
+                summary_columns = [
+                    'Athlète', 'Dernière date', 'Séances entraînement (total)', 'charge_totale', 'charge_7j', 'charge_28j', 'charge_42j',
+                    'acwr_7_28', 'acwr_7_42', 'Muscu %', 'Cardio %', 'Hockey %', 'Autres sports %'
+                ]
+                if 'Sommeil (h)' in summary_table.columns:
+                    summary_columns.append('Sommeil (h)')
+                if 'Fatigue score' in summary_table.columns:
+                    summary_columns.append('Fatigue score')
+                st.dataframe(summary_table[summary_columns], width='stretch', hide_index=True)
+                export_df = summary_table[summary_columns].rename(columns={'Dernière date': 'Date'}).copy()
+
+                pivot_ref_columns = ['Athlète', 'Dernière date', 'Référence calcul', 'charge_7j', 'charge_28j', 'charge_42j', 'acwr_7_28', 'acwr_7_42']
+                based_on_pivot_df = summary_table[summary_table['Basé sur date pivot']][pivot_ref_columns].copy()
+                not_based_on_pivot_df = summary_table[~summary_table['Basé sur date pivot']][pivot_ref_columns].copy()
+
+                c_pivot, c_non_pivot = st.columns(2)
+                c_pivot.metric("Calculs basés sur la date pivot", len(based_on_pivot_df))
+                c_non_pivot.metric("Calculs basés sur une autre date", len(not_based_on_pivot_df))
+
+                with st.expander("Qui est calculé sur la date pivot et qui ne l'est pas"):
+                    st.markdown("**Basé sur la date pivot**")
+                    if based_on_pivot_df.empty:
+                        st.info("Aucun athlète avec calcul basé sur la date pivot.")
+                    else:
+                        st.dataframe(based_on_pivot_df, width='stretch', hide_index=True)
+
+                    st.markdown("**Basé sur une autre date**")
+                    if not_based_on_pivot_df.empty:
+                        st.info("Tous les athlètes sont calculés sur la date pivot.")
+                    else:
+                        st.dataframe(not_based_on_pivot_df, width='stretch', hide_index=True)
+
+                ranking_df = summary_table[['Athlète', 'charge_totale', 'Dernière date']].copy()
+                ranking_df = ranking_df.sort_values('charge_totale', ascending=False).reset_index(drop=True)
+                ranking_df['Rang charge'] = ranking_df.index + 1
+                ranking_df = ranking_df[['Rang charge', 'Athlète', 'charge_totale', 'Dernière date']]
+
+                st.markdown("**Classement de la charge totale (du plus élevé au plus faible)**")
+
+                fig_ranking = px.bar(
+                    ranking_df,
+                    x='Athlète',
+                    y='charge_totale',
+                    title='Charge totale par athlète (ordre décroissant)',
+                    category_orders={'Athlète': ranking_df['Athlète'].tolist()},
+                )
+                fig_ranking.update_layout(showlegend=False)
+                st.plotly_chart(fig_ranking, width='stretch')
+
+                # Variabilité en se rapprochant du camp (avant la date pivot).
+                pivot_ts = pd.Timestamp(window_start)
+                if 'Sommeil (h)' in progression_df.columns or 'Fatigue score' in progression_df.columns:
+                    pre_camp_df = progression_df[progression_df['Date'] < pivot_ts].copy()
+                    recent_start = pivot_ts - pd.Timedelta(days=14)
+                    prev_start = pivot_ts - pd.Timedelta(days=28)
+
+                    variability_rows = []
+                    for athlete_id, athlete_hist in pre_camp_df.groupby('Athlète', sort=False):
+                        recent = athlete_hist[(athlete_hist['Date'] >= recent_start) & (athlete_hist['Date'] < pivot_ts)]
+                        prev = athlete_hist[(athlete_hist['Date'] >= prev_start) & (athlete_hist['Date'] < recent_start)]
+
+                        row = {
+                            'Athlète': athlete_id,
+                            'Séances entraînement (J-14 à J-1)': int((pd.to_numeric(recent['charge_totale'], errors='coerce').fillna(0) > 0).sum()) if 'charge_totale' in recent.columns else 0,
+                        }
+
+                        if 'Sommeil (h)' in pre_camp_df.columns:
+                            s_recent = pd.to_numeric(recent['Sommeil (h)'], errors='coerce')
+                            s_prev = pd.to_numeric(prev['Sommeil (h)'], errors='coerce')
+                            std_recent = float(s_recent.std()) if s_recent.notna().sum() >= 2 else np.nan
+                            std_prev = float(s_prev.std()) if s_prev.notna().sum() >= 2 else np.nan
+                            delta = std_recent - std_prev if pd.notna(std_recent) and pd.notna(std_prev) else np.nan
+                            mean_recent = float(s_recent.mean()) if s_recent.notna().any() else np.nan
+                            mean_prev = float(s_prev.mean()) if s_prev.notna().any() else np.nan
+                            sleep_delta = mean_recent - mean_prev if pd.notna(mean_recent) and pd.notna(mean_prev) else np.nan
+
+                            if pd.isna(sleep_delta):
+                                sleep_trend = 'Données insuffisantes'
+                            elif sleep_delta > 0.3:
+                                sleep_trend = 'Sommeil augmente'
+                            elif sleep_delta < -0.3:
+                                sleep_trend = 'Sommeil diminue'
+                            else:
+                                sleep_trend = 'Sommeil stable'
+
+                            row.update({
+                                'Sommeil moyen (J-28 à J-15)': mean_prev,
+                                'Sommeil moyen (J-14 à J-1)': mean_recent,
+                                'Delta sommeil (h)': sleep_delta,
+                                'Tendance sommeil': sleep_trend,
+                                'Variabilité sommeil (J-14 à J-1)': std_recent,
+                                'Variabilité sommeil (J-28 à J-15)': std_prev,
+                                'Delta variabilité sommeil': delta,
+                            })
+
+                        if 'Fatigue score' in pre_camp_df.columns:
+                            f_recent = pd.to_numeric(recent['Fatigue score'], errors='coerce')
+                            f_prev = pd.to_numeric(prev['Fatigue score'], errors='coerce')
+                            f_std_recent = float(f_recent.std()) if f_recent.notna().sum() >= 2 else np.nan
+                            f_std_prev = float(f_prev.std()) if f_prev.notna().sum() >= 2 else np.nan
+                            row.update({
+                                'Fatigue moyenne (J-14 à J-1)': float(f_recent.mean()) if f_recent.notna().any() else np.nan,
+                                'Variabilité fatigue (J-14 à J-1)': f_std_recent,
+                                'Variabilité fatigue (J-28 à J-15)': f_std_prev,
+                            })
+
+                        variability_rows.append(row)
+
+                    variability_df = pd.DataFrame(variability_rows)
+                    if not variability_df.empty:
+                        st.markdown("**Sommeil en se rapprochant du camp (simple à lire)**")
+                        st.caption("Comparaison des 14 derniers jours avant le camp (J-14 à J-1) avec les 14 jours précédents (J-28 à J-15).")
+
+                        if 'Delta sommeil (h)' in variability_df.columns:
+                            variability_df = variability_df.sort_values('Delta sommeil (h)', ascending=True)
+
+                        simple_cols = [c for c in [
+                            'Athlète',
+                            'Séances entraînement (J-14 à J-1)',
+                            'Sommeil moyen (J-28 à J-15)',
+                            'Sommeil moyen (J-14 à J-1)',
+                            'Delta sommeil (h)',
+                            'Tendance sommeil',
+                            'Variabilité sommeil (J-14 à J-1)',
+                        ] if c in variability_df.columns]
+                        st.dataframe(variability_df[simple_cols], width='stretch', hide_index=True)
+
+                        if 'Delta sommeil (h)' in variability_df.columns:
+                            chart_df = variability_df[['Athlète', 'Delta sommeil (h)']].dropna().copy()
+                            if not chart_df.empty:
+                                fig_var = px.bar(
+                                    chart_df,
+                                    x='Athlète',
+                                    y='Delta sommeil (h)',
+                                    title='Évolution du sommeil en approchant le camp (J-14 à J-1 vs J-28 à J-15)',
+                                    category_orders={'Athlète': chart_df.sort_values('Delta sommeil (h)', ascending=False)['Athlète'].tolist()},
+                                )
+                                fig_var.add_hline(y=0, line_dash='dash', line_color='#666666')
+                                fig_var.update_layout(showlegend=False)
+                                st.plotly_chart(fig_var, width='stretch')
+
+                problem_rows = []
+                for _, row in summary_table.iterrows():
+                    athlete = row.get('Athlète')
+                    acwr_28 = row.get('acwr_7_28')
+                    acwr_42 = row.get('acwr_7_42')
+                    charge_7j = row.get('charge_7j')
+                    charge_28j = row.get('charge_28j')
+                    charge_42j = row.get('charge_42j')
+
+                    def add_problem(metric, value, reason, severity):
+                        problem_rows.append({
+                            'Athlète': athlete,
+                            'Métrique': metric,
+                            'Valeur': value,
+                            'Problème': reason,
+                            'Sévérité': severity,
+                        })
+
+                    if pd.isna(charge_7j) or pd.isna(charge_28j) or pd.isna(charge_42j):
+                        add_problem('Fenêtres de charge', 'N/A', 'Historique insuffisant pour 7j/28j/42j', 'Moyenne')
+
+                    if pd.notna(acwr_28):
+                        if acwr_28 > 1.5:
+                            add_problem('ACWR 7/28', f"{acwr_28:.2f}", 'Surcharge élevée', 'Élevée')
+                        elif acwr_28 < 0.5:
+                            add_problem('ACWR 7/28', f"{acwr_28:.2f}", 'Sous-charge marquée', 'Moyenne')
+
+                    if pd.notna(acwr_42):
+                        if acwr_42 > 1.5:
+                            add_problem('ACWR 7/42', f"{acwr_42:.2f}", 'Surcharge élevée', 'Élevée')
+                        elif acwr_42 < 0.5:
+                            add_problem('ACWR 7/42', f"{acwr_42:.2f}", 'Sous-charge marquée', 'Moyenne')
+
+                    for pct_col, label in [('Muscu %', 'Musculation'), ('Cardio %', 'Cardio'), ('Hockey %', 'Hockey'), ('Autres sports %', 'Autres sports')]:
+                        pct_value = row.get(pct_col)
+                        if pd.notna(pct_value) and pct_value >= 85:
+                            add_problem(pct_col, f"{pct_value:.1f}%", f'Charge très concentrée en {label.lower()}', 'Moyenne')
+
+                st.markdown("**Valeurs problématiques**")
+                if problem_rows:
+                    problems_df = pd.DataFrame(problem_rows)
+                    severity_order = {'Élevée': 0, 'Moyenne': 1, 'Faible': 2}
+                    problems_df['_severity_rank'] = problems_df['Sévérité'].map(severity_order).fillna(99)
+                    problems_df = problems_df.sort_values(['_severity_rank', 'Athlète', 'Métrique']).drop(columns=['_severity_rank'])
+                    st.dataframe(problems_df, width='stretch', hide_index=True)
+                else:
+                    st.success("Aucune valeur problématique détectée selon les seuils actuels.")
+
+                with st.expander("Voir le détail par date (optionnel)"):
+                    st.dataframe(analysis_df[display_columns], width='stretch', hide_index=True)
+            else:
+                athlete_df = analysis_df.sort_values('Date').copy()
+                if not athlete_df.empty:
+                    export_df = athlete_df[display_columns].copy()
+                    tab_charge, tab_risque, tab_sante = st.tabs(['Charge', 'Risque', 'Sommeil / Blessure'])
+                    with tab_charge:
+                        fig_charge = px.line(
+                            athlete_df,
+                            x='Date',
+                            y=['charge_totale'],
+                            title='Charge quotidienne',
+                            markers=True,
+                        )
+                        st.plotly_chart(fig_charge, width='stretch')
+                    with tab_risque:
+                        fig_risk = px.line(
+                            athlete_df,
+                            x='Date',
+                            y=['acwr_7_28', 'acwr_7_42'],
+                            title='ACWR 7/28 et 7/42',
+                            markers=True,
+                        )
+                        st.plotly_chart(fig_risk, width='stretch')
+                    with tab_sante:
+                        if 'Sommeil (h)' in athlete_df.columns:
+                            fig_sleep = px.line(
+                                athlete_df,
+                                x='Date',
+                                y='Sommeil (h)',
+                                title='Sommeil',
+                                markers=True,
+                            )
+                            st.plotly_chart(fig_sleep, width='stretch')
+                        else:
+                            st.info("Aucune colonne sommeil détectée dans les données.")
+
+                        if 'Fatigue score' in athlete_df.columns:
+                            fig_fatigue = px.line(
+                                athlete_df,
+                                x='Date',
+                                y='Fatigue score',
+                                title='Fatigue (score)',
+                                markers=True,
+                            )
+                            st.plotly_chart(fig_fatigue, width='stretch')
+                        else:
+                            st.info("Aucune colonne fatigue détectée dans les données.")
+
+                        if 'Blessure' in athlete_df.columns:
+                            injury_count = int((athlete_df['Blessure'].fillna(0) > 0).sum())
+                            st.metric("Jours blessure détectés", injury_count)
+                        else:
+                            st.info("Aucune colonne blessure détectée dans les données.")
+
+                    with st.expander("Voir le tableau détaillé"):
+                        st.dataframe(athlete_df[display_columns], width='stretch', hide_index=True)
+
+            export_name = f"progression_{analysis_choice.replace(' ', '_').lower()}.csv"
+            export_payload = export_df if not export_df.empty else analysis_df.copy()
+            st.download_button(
+                "Télécharger la table de progression",
+                export_payload.to_csv(index=False).encode('utf-8'),
+                file_name=export_name,
+                mime='text/csv',
+            )
+
     selected_athlete = st.selectbox("Sélectionner un athlète", athletes)
     if selected_athlete:
-        show_athlete_dashboard(selected_athlete)
+        render_athlete_pdf_section(
+            selected_athlete,
+            f"Document PDF de {selected_athlete}",
+            f"coach_{sanitize_filename_component(selected_athlete)}",
+        )
+        st.divider()
+        show_athlete_dashboard(selected_athlete, show_pdf_section=False)
 
 
 # Vue admin: gestion des utilisateurs, import et édition des données.
@@ -2044,6 +2941,46 @@ def show_admin_dashboard():
     else:
         st.warning("Aucun participant trouvé.")
     
+    st.divider()
+
+    st.subheader("📄 Documents PDF par athlète")
+    all_known_athletes = sorted(
+        set(get_data_athlete_ids()).union(set(get_registered_athlete_ids())),
+        key=str.lower
+    )
+    if not all_known_athletes:
+        st.info("Aucun identifiant athlète disponible pour l'instant.")
+    else:
+        with st.form("admin_upload_athlete_pdf"):
+            selected_doc_athlete = st.selectbox(
+                "Athlète à associer au PDF",
+                all_known_athletes,
+                key="admin_pdf_athlete_select",
+            )
+            uploaded_pdf = st.file_uploader(
+                "Choisir un document PDF",
+                type=['pdf'],
+                key="admin_pdf_file_uploader",
+            )
+            submitted_pdf = st.form_submit_button("Téléverser / Remplacer le PDF")
+
+            if submitted_pdf:
+                saved, error_code, _ = save_athlete_pdf_document(selected_doc_athlete, uploaded_pdf)
+                if saved:
+                    st.success(f"PDF enregistré pour {selected_doc_athlete}.")
+                    st.rerun()
+                elif error_code == 'missing_file':
+                    st.error("Sélectionne un fichier PDF avant de valider.")
+                else:
+                    st.error("Impossible d'enregistrer le PDF. Vérifie les permissions du dossier de données.")
+
+    docs_df = list_athlete_pdf_documents()
+    if docs_df.empty:
+        st.caption("Aucun PDF associé pour le moment.")
+    else:
+        st.markdown("**PDF déjà associés**")
+        st.dataframe(docs_df, width='stretch', hide_index=True)
+
     st.divider()
 
     uploaded_file = st.file_uploader("Choisir un fichier à importer", type=['csv', 'xlsx'])

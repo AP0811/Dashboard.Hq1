@@ -19,6 +19,11 @@ Application Streamlit pour visualiser les charges de travail des athlètes, avec
 - Un coach peut sélectionner n'importe quel athlète dans le fichier
 - Les athlètes peuvent créer leur propre mot de passe depuis la barre latérale
 - Les comptes `admin` / `data_manager` peuvent importer de nouvelles données via l'interface d'administration
+- Les comptes `admin` / `data_manager` peuvent téléverser un document PDF différent pour chaque athlète
+- Un athlète peut consulter et télécharger uniquement son PDF personnel
+- Un coach peut consulter et télécharger le PDF de l'athlète sélectionné
+- Les coachs disposent d'une vue d'analyse simple avec ACWR 7/28, ACWR 7/42, EWMA, sommeil et blessures si disponibles
+- Les coachs peuvent exporter une table de progression CSV pour la fusion avec d'autres données
 
 
 ## Sécurité et Conformité Loi 25
