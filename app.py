@@ -303,31 +303,11 @@ def _r2_document_object_key(stored_name):
     return f"{R2_DOCUMENTS_PREFIX}/{safe_name}"
 
 
-def _r2_restore_documents_from_index():
+def _r2_restore_documents_index():
     if not _r2_is_configured():
         return
-    if not _r2_download_object_to_path(R2_ATHLETE_DOCS_INDEX_OBJECT_KEY, ATHLETE_DOCS_INDEX):
-        return
-
-    try:
-        with open(ATHLETE_DOCS_INDEX, 'r', encoding='utf-8') as f:
-            index_payload = json.load(f)
-    except Exception:
-        return
-
-    if not isinstance(index_payload, dict):
-        return
-
-    for entry in index_payload.values():
-        if not isinstance(entry, Mapping):
-            continue
-        stored_name = str(entry.get('stored_name', '')).strip()
-        if not stored_name:
-            continue
-        local_pdf_path = os.path.join(ATHLETE_DOCS_FOLDER, stored_name)
-        if os.path.exists(local_pdf_path):
-            continue
-        _r2_download_object_to_path(_r2_document_object_key(stored_name), local_pdf_path)
+    # Restaurer uniquement l'index au démarrage (les PDFs sont téléchargés à la demande).
+    _r2_download_object_to_path(R2_ATHLETE_DOCS_INDEX_OBJECT_KEY, ATHLETE_DOCS_INDEX)
 
 
 def _r2_backfill_local_documents_to_r2():
@@ -363,8 +343,7 @@ def _bootstrap_from_r2():
     # Toujours tenter une synchro au démarrage pour refléter les dernières données partagées.
     _r2_download_object_to_path(R2_ACTIVITIES_OBJECT_KEY, file_path)
     _r2_download_object_to_path(R2_CREDENTIALS_OBJECT_KEY, CREDENTIALS_CSV)
-    _r2_restore_documents_from_index()
-    _r2_backfill_local_documents_to_r2()
+    _r2_restore_documents_index()
 
 
 # Trouve une colonne en essayant plusieurs noms possibles (égalité stricte puis partielle).
@@ -1128,9 +1107,18 @@ def render_athlete_pdf_section(athlete_id, title, widget_key_prefix):
         key=f"{widget_key_prefix}_download_pdf",
     )
 
-    with st.expander("Aperçu PDF", expanded=True):
+    with st.expander("Aperçu PDF", expanded=False):
+        show_preview = st.checkbox(
+            "Charger l'aperçu (plus lent)",
+            value=False,
+            key=f"{widget_key_prefix}_load_preview",
+        )
+        if not show_preview:
+            st.caption("L'aperçu est désactivé par défaut pour accélérer l'application.")
+            return
+
         try:
-            preview_pages, total_pages = render_pdf_preview_pages(pdf_bytes, max_pages=10, zoom=1.2)
+            preview_pages, total_pages = render_pdf_preview_pages(pdf_bytes, max_pages=3, zoom=1.1)
             if not preview_pages:
                 if fitz is None:
                     st.info("Aperçu indisponible: PyMuPDF n'est pas installé. Utilisez le bouton de téléchargement.")
